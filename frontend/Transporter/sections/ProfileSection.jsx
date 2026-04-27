@@ -11,7 +11,7 @@ import { LinearGradient } from 'expo-linear-gradient';
 import * as Location     from 'expo-location';
 import { api }            from '../services/ApiService';
 
-const GOOGLE_API_KEY = 'AIzaSyBrYAA7OEcYgtRqH8HXAS5OMi30IMZF-60';
+const GOOGLE_API_KEY = 'AIzaSyAURA_WOTStUtf3-nnDUR88jeBr6qSejFs';
 
 const G = {
   main:'#415844', dark:'#2D3E2F', light:'#EDF1ED', accent:'#69F0AE',

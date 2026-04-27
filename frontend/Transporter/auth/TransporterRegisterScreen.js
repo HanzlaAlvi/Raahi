@@ -14,7 +14,7 @@ import { Ionicons } from '@expo/vector-icons';
 import * as Location from 'expo-location';
 
 const API_BASE_URL = 'https://raahi-q2ur.onrender.com/api';
-const GOOGLE_API_KEY = 'AIzaSyBrYAA7OEcYgtRqH8HXAS5OMi30IMZF-60';
+const GOOGLE_API_KEY = 'AIzaSyAURA_WOTStUtf3-nnDUR88jeBr6qSejFs';
 const { height: SH } = Dimensions.get('window');
 
 const C = {

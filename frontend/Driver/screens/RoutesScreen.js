@@ -26,7 +26,7 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 // ─── Constants ────────────────────────────────────────────────────────────────
 const API_BASE   = "https://raahi-q2ur.onrender.com/api";
 const SOCKET_URL = "https://raahi-q2ur.onrender.com";
-const GMAPS_KEY  = "AIzaSyBrYAA7OEcYgtRqH8HXAS5OMi30IMZF-60";   // ← replace with actual key
+const GMAPS_KEY  = "AIzaSyAURA_WOTStUtf3-nnDUR88jeBr6qSejFs";   // ← replace with actual key
 const MAX_TYPED  = 3;
 const LOC_INTERVAL_MS = 7000;   // send location every 7 seconds
 

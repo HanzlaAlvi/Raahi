@@ -124,7 +124,7 @@ router.get('/directions', async (req, res) => {
   try {
     const { origin, destination, waypoints, mode = 'driving' } = req.query;
     if (!origin || !destination) return res.status(400).json({ success: false, message: 'origin and destination required' });
-    const GOOGLE_KEY = 'AIzaSyBrYAA7OEcYgtRqH8HXAS5OMi30IMZF-60';
+    const GOOGLE_KEY = 'AIzaSyAURA_WOTStUtf3-nnDUR88jeBr6qSejFs';
     const params = new URLSearchParams({ origin, destination, key: GOOGLE_KEY, mode, language: 'en', units: 'metric' });
     if (waypoints) params.append('waypoints', `optimize:true|${waypoints}`);
     const response = await axios.get(`https://maps.googleapis.com/maps/api/directions/json?${params}`, { timeout: 10000 });

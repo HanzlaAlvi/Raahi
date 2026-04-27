@@ -16,7 +16,7 @@ const API_BASE_URL = Platform.select({
   android: "https://raahi-q2ur.onrender.com",
   default: "https://raahi-q2ur.onrender.com",
 });
-const GOOGLE_MAPS_API_KEY = "AIzaSyBrYAA7OEcYgtRqH8HXAS5OMi30IMZF-60";
+const GOOGLE_MAPS_API_KEY = "AIzaSyAURA_WOTStUtf3-nnDUR88jeBr6qSejFs";
 const { height: SH } = Dimensions.get("window");
 
 // ─────────────────────────────────────────────────────────────────────────────

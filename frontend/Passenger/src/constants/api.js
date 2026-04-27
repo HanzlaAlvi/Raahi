@@ -4,7 +4,7 @@
 
 export const API_BASE_URL = 'https://raahi-q2ur.onrender.com/api';
 
-export const GOOGLE_MAPS_API_KEY = 'AIzaSyBrYAA7OEcYgtRqH8HXAS5OMi30IMZF-60';
+export const GOOGLE_MAPS_API_KEY = 'AIzaSyAURA_WOTStUtf3-nnDUR88jeBr6qSejFs';
 
 export const ENDPOINTS = {
   // Auth
