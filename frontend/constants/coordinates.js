@@ -1,0 +1,20 @@
+
+export const stopCoordinates = {
+  'Chaklala Bus Stop': { latitude: 33.6008, longitude: 73.0963 },
+  'Korang Road': { latitude: 33.583, longitude: 73.1 },
+  'Scheme 3': { latitude: 33.5858, longitude: 73.0887 },
+  'PWD Housing': { latitude: 33.571, longitude: 73.145 },
+  'Gulberg Greens': { latitude: 33.6, longitude: 73.16 },
+  'F-7 Markaz': { latitude: 33.7214, longitude: 73.0572 },
+  'F-8 Markaz': { latitude: 33.710, longitude: 73.040 },
+  'F-10 Markaz': { latitude: 33.6953, longitude: 73.0129 },
+  'I-10 Markaz': { latitude: 33.6476, longitude: 73.0388 },
+  'G-11 Markaz': { latitude: 33.6686, longitude: 72.998 },
+  'G-10 Markaz': { latitude: 33.6751, longitude: 73.017 },
+  'Van 1 (Toyota Hiace)': { latitude: 33.6844, longitude: 73.0479 },
+  'Van 2 (Toyota Hiace)': { latitude: 33.6844, longitude: 73.0479 },
+  'Van 3 (Toyota Hiace)': { latitude: 33.6844, longitude: 73.0479 },
+  'Van 1 Markaz': { latitude: 33.6844, longitude: 73.0479 },
+  'Van 2 Markaz': { latitude: 33.6844, longitude: 73.0479 },
+  'Van 3 Markaz': { latitude: 33.6844, longitude: 73.0479 },
+};

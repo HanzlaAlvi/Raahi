@@ -1,0 +1,77 @@
+{
+  "expo": {
+    "name": "Raahi",
+    "slug": "raahi-app",
+    "scheme": "raahi",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./frontend/screens/logo.png",
+    "userInterfaceStyle": "light",
+    "splash": {
+      "image": "./frontend/screens/logo.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#ffffff"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.hanzla.raahi"
+    },
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./frontend/screens/logo.png",
+        "backgroundColor": "#ffffff"
+      },
+      "package": "com.hanzla.raahi",
+      "googleServicesFile": "./google-services.json",
+      "config": {
+        "googleMaps": {
+          "apiKey": "AIzaSyBrYAA7OEcYgtRqH8HXAS5OMi30IMZF-60"
+        }
+      },
+      "permissions": [
+        "ACCESS_COARSE_LOCATION",
+        "ACCESS_FINE_LOCATION",
+        "FOREGROUND_SERVICE",
+        "RECEIVE_BOOT_COMPLETED",
+        "VIBRATE",
+        "USE_EXACT_ALARM",
+        "SCHEDULE_EXACT_ALARM",
+        "USE_FULL_SCREEN_INTENT",
+        "WAKE_LOCK",
+        "POST_NOTIFICATIONS"
+      ]
+    },
+    "web": {
+      "favicon": "./frontend/screens/logo.png"
+    },
+    "plugins": [
+      "expo-localization",
+      "expo-font",
+      "@react-native-community/datetimepicker",
+      "@react-native-firebase/app",
+      "@react-native-firebase/messaging",
+      [
+        "expo-build-properties",
+        {
+          "android": {
+            "extraMavenRepos": [
+              "https://maven.google.com",
+              "https://www.jitpack.io"
+            ],
+            "allProjectsRepositories": [
+              "google()",
+              "mavenCentral()",
+              "maven { url 'https://www.jitpack.io' }"
+            ]
+          }
+        }
+      ]
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "f081ff62-2d72-4d22-9460-f3d9d0bef2dc"
+      }
+    },
+    "owner": "hanzla_9"
+  }
+}

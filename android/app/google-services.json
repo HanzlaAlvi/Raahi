@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "694456281844",
+    "project_id": "raahi-bebb3",
+    "storage_bucket": "raahi-bebb3.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:694456281844:android:bd333949fc7d56db3c4ca1",
+        "android_client_info": {
+          "package_name": "com.hanzla.raahi"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBl7ExlECndy6wTEmCKgxRzjrUqtucQ8qk"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

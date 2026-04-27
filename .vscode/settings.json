@@ -1,0 +1,10 @@
+{
+    "java.configuration.updateBuildConfiguration": "interactive",
+    "java.compile.nullAnalysis.mode": "automatic",
+    "typescript.tsdk": "node_modules/typescript/lib",
+    "typescript.preferences.excludeLibrarySymbolsInNavTo": true,
+    "cSpell.words": [
+        "LGREEN"
+    ],
+    "folder-color.pathColors": []
+}
