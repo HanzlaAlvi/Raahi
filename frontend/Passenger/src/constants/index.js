@@ -37,6 +37,9 @@ export const SCREENS = {
   SETTINGS:          'Settings',
   HELP_SUPPORT:      'HelpSupport',
   CONTACT_SUPPORT:   'ContactSupport',
+  TRANSPORTER_CHAT:  'TransporterChat',
+  LEAVE_NETWORK:     'LeaveNetwork',
+  DELETE_ACCOUNT:    'DeleteAccount',
   TERMS_CONDITIONS:  'TermsConditions',
 
   // ── Internal stack inside Drawer ──────────────────────────────────────────

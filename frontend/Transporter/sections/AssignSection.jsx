@@ -1,5 +1,4 @@
 // frontend/Transporter/sections/AssignSection.jsx
-//
 // CHANGES FROM ORIGINAL:
 //   1. Added isAutoProcessed badge — routes auto-processed at midnight show a
 //      purple "Auto-Processed" banner with robot icon, replacing the generic
@@ -52,15 +51,14 @@ const P = {
   error:      '#8B2020',
   errorBg:    '#FDEAEA',
   errorMid:   '#E53935',
-  // ── purple for AI / auto-processed ──────────────────────────────
-  ai:         '#6C3FB5',
-  aiBg:       '#F0EBFF',
-  aiBorder:   '#C4A8F0',
-  // ── NEW: slightly different purple for "auto-processed" so it's
-  //    visually distinct from the AI suggestion card ──────────────
-  auto:       '#7C3AED',
-  autoBg:     '#EDE9FE',
-  autoBorder: '#A78BFA',
+  // ── AI: soft indigo-blue that complements the green theme ─────
+  ai:         '#5b5e75',
+  aiBg:       '#E8EAF6',
+  aiBorder:   '#C5CAE9',
+  // ── auto-processed: distinct purple (reserved for system auto) ─
+  auto:       '#064f49', 
+  autoBg:     '#eaf1f0', 
+  autoBorder: '#1e7771', 
   ink:        '#0F1A10',
 };
 
@@ -344,7 +342,7 @@ export default function AssignSection({ routes: propRoutes, onRefresh }) {
 
     // ── Header gradient colours based on route state ──────────────
     const headerGradient = isAutoProcessed
-      ? [P.auto, '#5B21B6']          // purple  — system auto-processed
+      ? [P.success, P.dark]          // green   — auto-processed (card looks assigned)
       : isAssigned
         ? [P.success, P.dark]        // green   — manually assigned
         : [P.warnMid, P.warn];       // amber   — pending
@@ -369,7 +367,7 @@ export default function AssignSection({ routes: propRoutes, onRefresh }) {
         {/* Header */}
         <TouchableOpacity onPress={() => setExpanded(!expanded)} activeOpacity={0.82} style={s.routeHeader}>
           <LinearGradient colors={headerGradient} style={s.routeIconBox} start={{ x: 0, y: 0 }} end={{ x: 1, y: 1 }}>
-            <Ionicons name={isAutoProcessed ? 'hardware-chip' : 'map'} size={17} color={P.white} />
+           <Ionicons name={isAutoProcessed ? 'hardware-chip' : 'map'} size={17} color={P.white} />
           </LinearGradient>
 
           <View style={{ flex: 1, marginLeft: 14 }}>
@@ -433,7 +431,7 @@ export default function AssignSection({ routes: propRoutes, onRefresh }) {
             {/* ── NEW: Auto-process detail card ─────────────────── */}
             {isAutoProcessed && (
               <View style={s.autoDetailCard}>
-                <LinearGradient colors={[P.auto, '#5B21B6']} style={s.autoDetailIcon} start={{ x: 0, y: 0 }} end={{ x: 1, y: 1 }}>
+                <LinearGradient colors={[P.auto, '#6D28D9']} style={s.autoDetailIcon} start={{ x: 0, y: 0 }} end={{ x: 1, y: 1 }}>
                   <Ionicons name="hardware-chip" size={16} color={P.white} />
                 </LinearGradient>
                 <View style={{ flex: 1, marginLeft: 10 }}>
@@ -492,7 +490,7 @@ export default function AssignSection({ routes: propRoutes, onRefresh }) {
 
               return (
                 <View style={s.aiCard}>
-                  <LinearGradient colors={[P.ai, '#8B5CF6']} style={s.aiIconBox} start={{ x: 0, y: 0 }} end={{ x: 1, y: 1 }}>
+                  <LinearGradient colors={[P.ai, '#3949AB']} style={s.aiIconBox} start={{ x: 0, y: 0 }} end={{ x: 1, y: 1 }}>
                     <Ionicons name="sparkles" size={14} color={P.white} />
                   </LinearGradient>
                   <View style={{ flex: 1, marginLeft: 10 }}>
@@ -647,7 +645,7 @@ export default function AssignSection({ routes: propRoutes, onRefresh }) {
                         >
                           <LinearGradient
                             colors={
-                              isBest    ? [P.ai,    '#6D28D9'] :
+                              isBest    ? [P.ai,    '#3949AB'] :
                               isCurrent ? [P.main,  P.dark]   :
                               isAvailable ? ['#4A6C4E', '#2D3E2F'] : ['#9E9E9E', '#757575']
                             }
@@ -795,8 +793,8 @@ export default function AssignSection({ routes: propRoutes, onRefresh }) {
           val={autoProcessedCount}
           label="Auto"
           icon="hardware-chip-outline"
-          gradColors={['#5B21B6', '#4C1D95']}
-          textColor="#DDD6FE"
+          gradColors={['#20a347', '#20570e']}
+          textColor="#EDE9FE"
         />
       </View>
 
@@ -997,7 +995,7 @@ const s = StyleSheet.create({
     }),
   },
   routeCardAssigned: { borderColor: P.success + '55' },
-  routeCardAuto:     { borderColor: P.autoBorder },   // NEW
+  routeCardAuto:     { borderColor: P.success + '55' },   // subtle green border
 
   routeHeader:   { flexDirection: 'row', alignItems: 'center', padding: 14 },
   routeIconBox:  { width: 42, height: 42, borderRadius: 13, alignItems: 'center', justifyContent: 'center', flexShrink: 0 },
@@ -1049,7 +1047,7 @@ const s = StyleSheet.create({
     borderWidth: 1.5, borderColor: P.border,
   },
   driverCardActive: { borderColor: P.main, backgroundColor: '#EDF2ED' },
-  driverCardBest:   { borderColor: P.ai,   backgroundColor: '#F5F0FF' },
+  driverCardBest:   { borderColor: P.ai,   backgroundColor: '#E8EAF6' },
 
   driverAvatar:    { width: 46, height: 46, borderRadius: 14, alignItems: 'center', justifyContent: 'center', flexShrink: 0 },
   driverAvatarTxt: { fontWeight: '900', fontSize: 17, color: P.white },

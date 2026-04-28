@@ -550,15 +550,7 @@ export default function PaymentsScreen({ navigation }) {
       <StatusBar barStyle="light-content" backgroundColor={C.primaryDark} />
 
       {/* ── AppBar ── */}
-      <LinearGradient colors={[C.primary, C.primaryDark]} style={headerStyle}>
-        <TouchableOpacity style={iconBtn} onPress={() => navigation.goBack()}>
-          <Ionicons name="arrow-back" size={22} color={C.white} />
-        </TouchableOpacity>
-        <Text style={headerTitle}>Subscription</Text>
-        <TouchableOpacity style={iconBtn} onPress={fetchAll}>
-          <Ionicons name="refresh-outline" size={21} color={C.white} />
-        </TouchableOpacity>
-      </LinearGradient>
+      
 
       {/* ── Tabs ── */}
       <View style={{ flexDirection: 'row', backgroundColor: C.white, paddingHorizontal: 14, paddingVertical: 8, borderBottomWidth: 1, borderBottomColor: C.border, gap: 8 }}>

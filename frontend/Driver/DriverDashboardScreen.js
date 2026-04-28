@@ -5,7 +5,6 @@ import {
   View, Text, TouchableOpacity, ScrollView,
   Alert, ActivityIndicator, StatusBar,
   StyleSheet, Platform, Animated,
-  Modal, TextInput, KeyboardAvoidingView,
 } from "react-native";
 import { Ionicons }       from "@expo/vector-icons";
 import { LinearGradient } from "expo-linear-gradient";
@@ -30,8 +29,11 @@ import HistoryScreen       from "./screens/HistoryScreen";
 import PaymentsScreen      from "./screens/PaymentsScreen";
 import SupportScreen       from "./screens/SupportScreen";
 import NotificationsScreen from "./screens/NotificationsScreen";
-import DriverProfileScreen from "./screens/DriverProfileScreen";
-import DriverChatModal     from "./components/DriverChatModal";
+import DriverProfileScreen   from "./screens/DriverProfileScreen";
+import DriverChatModal       from "./components/DriverChatModal";
+import MonthlyFeedbackScreen from "./screens/MonthlyFeedbackScreen";
+import LeaveNetworkScreen    from "./screens/LeaveNetworkScreen";
+import DeleteAccountScreen   from "./screens/DeleteAccountScreen";
 
 // ── Persistence keys for pickup confirmation state ─────────────────────────
 const PERSIST_WAITING_STOP    = "driver_waitingAtStop";
@@ -171,18 +173,21 @@ const MENU = [
   { view: "Payments",     label: "Payments",     icon: "card-outline",        activeIcon: "card"          },
   { view: "Support",      label: "Complaints",   icon: "warning-outline",     activeIcon: "warning"       },
   { view: "Messages",     label: "Messages",     icon: "chatbubbles-outline", activeIcon: "chatbubbles"   },
+  { view: "MonthlyFeedback", label: "Monthly Feedback", icon: "star-outline", activeIcon: "star"       },
 ];
 
 const SECTION_TITLES = {
-  Dashboard:     "Dashboard",
-  Availability:  "Availability",
-  Routes:        "Routes",
-  History:       "Trip History",
-  Payments:      "Payments",
-  Support:       "Complaints",
-  Notifications: "Notifications",
-  Profile:       "My Profile",
-  Messages:      "Messages",
+  Dashboard:            "Dashboard",
+  Availability:         "Availability",
+  Routes:               "Routes",
+  History:              "Trip History",
+  Payments:             "Payments",
+  Support:              "Complaints",
+  Notifications:        "Notifications",
+  Profile:              "My Profile",
+  Messages:             "Messages",
+  LeaveNetwork:         "Leave Transporter Network",
+  DeleteAccount:        "Delete Account Permanently",
 };
 
 const initials = (name = "D") =>
@@ -257,18 +262,7 @@ export default function UnifiedDriverDashboard({ navigation }) {
   const slideAnim = useRef(new Animated.Value(-300)).current;
   const blinkAnim = useRef(new Animated.Value(0)).current;
 
-  // ── Leave Network ───────────────────────────────────────────────────────────
-  const [leaveNetworkVisible, setLeaveNetworkVisible] = useState(false);
-  const [leaveEmail,          setLeaveEmail]          = useState('');
-  const [leaveLoading,        setLeaveLoading]        = useState(false);
-
-  // ── Delete Account Permanently ────────────────────────────────────────────
-  const [deleteAcctVisible, setDeleteAcctVisible] = useState(false);
-  const [deleteEmail,       setDeleteEmail]       = useState('');
-  const [deleteLoading,     setDeleteLoading]     = useState(false);
-
   // ── Monthly Feedback ────────────────────────────────────────────────────────
-  const [feedbackVisible,   setFeedbackVisible]   = useState(false);
   const [feedbackWindow,    setFeedbackWindow]     = useState({ isOpen: false, month: '', alreadySubmitted: false });
   const [feedbackAnswers,   setFeedbackAnswers]    = useState({});
   const [feedbackSubject,   setFeedbackSubject]    = useState('');
@@ -861,88 +855,6 @@ export default function UnifiedDriverDashboard({ navigation }) {
       const d = await r.json();
       if (d.success) setFeedbackWindow(d);
     } catch { }
-  };
-
-  // ── Leave transporter network ────────────────────────────────────────────
-  const handleLeaveNetwork = () => {
-    if (!leaveEmail.trim()) {
-      Alert.alert('Email Required', 'Please enter your registered email to confirm.');
-      return;
-    }
-    Alert.alert(
-      'Leave Transporter Network',
-      'This will permanently delete your account and all associated data. You will need to re-register to join again. Are you sure?',
-      [
-        { text: 'Cancel', style: 'cancel' },
-        {
-          text: 'Yes, Leave Network',
-          style: 'destructive',
-          onPress: async () => {
-            setLeaveLoading(true);
-            try {
-              const tok = authTokenRef.current;
-              const res = await fetch(`${API_BASE_URL}/account/leave-network`, {
-                method: 'DELETE',
-                headers: { ...getHeaders(tok), 'Content-Type': 'application/json' },
-                body: JSON.stringify({ email: leaveEmail.trim() }),
-              });
-              const data = await res.json();
-              if (data.success) {
-                await AsyncStorage.multiRemove(['authToken', 'userId', 'driverId', 'userData']);
-                navigation.reset({ index: 0, routes: [{ name: 'Login' }] });
-              } else {
-                Alert.alert('Error', data.message || 'Could not process your request.');
-              }
-            } catch {
-              Alert.alert('Error', 'Could not connect to server. Please try again.');
-            } finally {
-              setLeaveLoading(false);
-            }
-          },
-        },
-      ]
-    );
-  };
-
-  // ── Delete Account Permanently ───────────────────────────────────────────
-  const handleDeleteAccount = () => {
-    if (!deleteEmail.trim()) {
-      Alert.alert('Email Required', 'Please enter your registered email to confirm deletion.');
-      return;
-    }
-    Alert.alert(
-      'Delete Account Permanently',
-      'This will permanently delete your account and ALL associated data. You cannot undo this action. Are you absolutely sure?',
-      [
-        { text: 'Cancel', style: 'cancel' },
-        {
-          text: 'Yes, Delete Permanently',
-          style: 'destructive',
-          onPress: async () => {
-            setDeleteLoading(true);
-            try {
-              const tok = authTokenRef.current;
-              const res = await fetch(`${API_BASE_URL}/account/delete`, {
-                method: 'DELETE',
-                headers: { ...getHeaders(tok), 'Content-Type': 'application/json' },
-                body: JSON.stringify({ email: deleteEmail.trim() }),
-              });
-              const data = await res.json();
-              if (data.success) {
-                await AsyncStorage.multiRemove(['authToken', 'userId', 'driverId', 'userData']);
-                navigation.reset({ index: 0, routes: [{ name: 'Login' }] });
-              } else {
-                Alert.alert('Error', data.message || 'Could not delete account.');
-              }
-            } catch {
-              Alert.alert('Error', 'Could not connect to server. Please try again.');
-            } finally {
-              setDeleteLoading(false);
-            }
-          },
-        },
-      ]
-    );
   };
 
   // ── Submit monthly feedback ───────────────────────────────────────────────
@@ -1739,6 +1651,31 @@ export default function UnifiedDriverDashboard({ navigation }) {
           {currentView === "Support" && <SupportScreen       {...screenProps} />}
           {currentView === "Notifications" && <NotificationsScreen {...screenProps} />}
           {currentView === "Profile" && <DriverProfileScreen {...screenProps} />}
+          {currentView === "MonthlyFeedback" && (
+            <MonthlyFeedbackScreen
+              authTokenRef={authTokenRef}
+              getHeaders={getHeaders}
+              navigateTo={navigateTo}
+            />
+          )}
+          {currentView === "LeaveNetwork" && (
+            <LeaveNetworkScreen
+              driverProfile={driverProfile}
+              authTokenRef={authTokenRef}
+              getHeaders={getHeaders}
+              navigateTo={navigateTo}
+              navigation={navigation}
+            />
+          )}
+          {currentView === "DeleteAccount" && (
+            <DeleteAccountScreen
+              driverProfile={driverProfile}
+              authTokenRef={authTokenRef}
+              getHeaders={getHeaders}
+              navigateTo={navigateTo}
+              navigation={navigation}
+            />
+          )}
 
           {currentView === "Messages" && (
             <DriverChatModal
@@ -1811,56 +1748,32 @@ export default function UnifiedDriverDashboard({ navigation }) {
 
             <View style={s.menuDivider} />
 
-            {/* Monthly Feedback — only visible during last week of month */}
-            {feedbackWindow.isOpen && !feedbackWindow.alreadySubmitted && (
-              <>
-                <Text style={s.menuSectionLabel}>FEEDBACK</Text>
-                <TouchableOpacity
-                  style={s.menuItem}
-                  onPress={() => { setSidebarOpen(false); setTimeout(() => setFeedbackVisible(true), 200); }}
-                  activeOpacity={0.75}
-                >
-                  <View style={[s.menuIconBox, { backgroundColor: '#E8F5E9' }]}>
-                    <Ionicons name="star-outline" size={18} color={P.main} />
-                  </View>
-                  <View style={{ flex: 1 }}>
-                    <Text style={s.menuItemTxt}>Monthly Feedback</Text>
-                    <Text style={{ fontSize: 10, color: P.textLight, marginTop: 1 }}>
-                      {feedbackWindow.month} — Window Open
-                    </Text>
-                  </View>
-                  <View style={{ backgroundColor: '#E8F5E9', borderRadius: 8, paddingHorizontal: 7, paddingVertical: 3 }}>
-                    <Text style={{ fontSize: 10, color: P.main, fontWeight: '700' }}>NEW</Text>
-                  </View>
-                </TouchableOpacity>
-                <View style={s.menuDivider} />
-              </>
-            )}
+            
 
-            {/* Leave Transporter Network */}
+            {/* Leave Transporter Network — navigates to dedicated screen */}
             <TouchableOpacity
               style={s.menuItem}
-              onPress={() => { setSidebarOpen(false); setTimeout(() => setLeaveNetworkVisible(true), 200); }}
+              onPress={() => navigateTo("LeaveNetwork")}
               activeOpacity={0.75}
             >
-              <View style={[s.menuIconBox, { backgroundColor: '#FFEBEE' }]}>
-                <Ionicons name="exit-outline" size={18} color={P.error} />
+              <View style={[s.menuIconBox, { backgroundColor: '#FFF3E0' }]}>
+                <Ionicons name="exit-outline" size={18} color="#E65100" />
               </View>
-              <Text style={[s.menuItemTxt, { color: P.error }]}>Leave Transporter Network</Text>
-              <Ionicons name="chevron-forward" size={14} color={P.error + '80'} />
+              <Text style={[s.menuItemTxt, { color: '#E65100' }]}>Leave Transporter Network</Text>
+              <Ionicons name="chevron-forward" size={14} color="#E6510080" />
             </TouchableOpacity>
 
-            {/* Delete Account Permanently */}
+            {/* Delete Account Permanently — navigates to dedicated screen */}
             <TouchableOpacity
               style={s.menuItem}
-              onPress={() => { setSidebarOpen(false); setTimeout(() => setDeleteAcctVisible(true), 200); }}
+              onPress={() => navigateTo("DeleteAccount")}
               activeOpacity={0.75}
             >
               <View style={[s.menuIconBox, { backgroundColor: '#FFEBEE' }]}>
-                <Ionicons name="trash-outline" size={18} color="#C62828" />
+                <Ionicons name="trash-outline" size={18} color={P.main} />
               </View>
-              <Text style={[s.menuItemTxt, { color: '#C62828' }]}>Delete Account Permanently</Text>
-              <Ionicons name="chevron-forward" size={14} color="#C6282880" />
+              <Text style={[s.menuItemTxt, { color: P.main }]}>Delete Account Permanently</Text>
+              <Ionicons name="chevron-forward" size={14} color={P.main + '80'} />
             </TouchableOpacity>
 
             <View style={s.menuDivider} />
@@ -1883,167 +1796,7 @@ export default function UnifiedDriverDashboard({ navigation }) {
           </View>
         )}
 
-        {/* ── Delete Account Permanently Modal ──────────────────────────── */}
-        <Modal visible={deleteAcctVisible} animationType="slide" presentationStyle="pageSheet" onRequestClose={() => setDeleteAcctVisible(false)}>
-          <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : 'height'}>
-            <View style={{ flex: 1, backgroundColor: '#F5F7F5' }}>
-              <LinearGradient colors={['#C62828', '#B71C1C']} style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 16, paddingTop: Platform.OS === 'ios' ? 54 : 40, paddingBottom: 14 }}>
-                <TouchableOpacity onPress={() => setDeleteAcctVisible(false)} style={{ width: 38, height: 38, borderRadius: 10, backgroundColor: 'rgba(255,255,255,0.15)', alignItems: 'center', justifyContent: 'center' }}>
-                  <Ionicons name="close" size={22} color="#fff" />
-                </TouchableOpacity>
-                <Text style={{ fontSize: 17, fontWeight: '800', color: '#fff' }}>Delete Account</Text>
-                <View style={{ width: 38 }} />
-              </LinearGradient>
-              <ScrollView contentContainerStyle={{ padding: 20 }} showsVerticalScrollIndicator={false}>
-                <View style={{ backgroundColor: '#FFEBEE', borderRadius: 16, padding: 18, marginBottom: 24, alignItems: 'center', borderWidth: 1, borderColor: '#FFCDD2', gap: 10 }}>
-                  <Ionicons name="trash-outline" size={36} color="#C62828" />
-                  <Text style={{ fontSize: 16, fontWeight: '800', color: '#C62828', textAlign: 'center' }}>Permanent Deletion</Text>
-                  <Text style={{ fontSize: 13, color: '#B71C1C', textAlign: 'center', lineHeight: 20 }}>
-                    This will permanently delete your account and all associated data including trip history, payments, and messages. This action CANNOT be undone.
-                  </Text>
-                </View>
-                <Text style={{ fontSize: 13, fontWeight: '700', color: '#374151', marginBottom: 8 }}>Confirm your email address</Text>
-                <TextInput
-                  style={{ backgroundColor: '#fff', borderWidth: 1.5, borderColor: '#C5D0C5', borderRadius: 12, padding: 14, fontSize: 14, color: '#1A2218', marginBottom: 20 }}
-                  placeholder="Enter your registered email"
-                  placeholderTextColor="#9CA3AF"
-                  value={deleteEmail}
-                  onChangeText={setDeleteEmail}
-                  keyboardType="email-address"
-                  autoCapitalize="none"
-                />
-                <TouchableOpacity
-                  style={[{ flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 10, backgroundColor: '#C62828', borderRadius: 14, paddingVertical: 16, marginBottom: 12 }, deleteLoading && { opacity: 0.6 }]}
-                  onPress={handleDeleteAccount}
-                  disabled={deleteLoading}
-                  activeOpacity={0.85}
-                >
-                  {deleteLoading
-                    ? <ActivityIndicator size="small" color="#fff" />
-                    : <><Ionicons name="trash-outline" size={18} color="#fff" /><Text style={{ fontSize: 15, fontWeight: '800', color: '#fff' }}>Delete Account Permanently</Text></>}
-                </TouchableOpacity>
-                <TouchableOpacity style={{ alignItems: 'center', paddingVertical: 14 }} onPress={() => setDeleteAcctVisible(false)} activeOpacity={0.75}>
-                  <Text style={{ fontSize: 14, fontWeight: '600', color: '#6B7280' }}>Cancel</Text>
-                </TouchableOpacity>
-              </ScrollView>
-            </View>
-          </KeyboardAvoidingView>
-        </Modal>
 
-        {/* ── Leave Transporter Network Modal ────────────────────────────── */}
-        <Modal visible={leaveNetworkVisible} animationType="slide" presentationStyle="pageSheet" onRequestClose={() => setLeaveNetworkVisible(false)}>
-          <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : 'height'}>
-            <View style={{ flex: 1, backgroundColor: '#F5F7F5' }}>
-              <LinearGradient colors={[P.main, P.dark]} style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 16, paddingTop: Platform.OS === 'ios' ? 54 : 40, paddingBottom: 14 }}>
-                <TouchableOpacity onPress={() => setLeaveNetworkVisible(false)} style={{ width: 38, height: 38, borderRadius: 10, backgroundColor: 'rgba(255,255,255,0.15)', alignItems: 'center', justifyContent: 'center' }}>
-                  <Ionicons name="close" size={22} color={P.white} />
-                </TouchableOpacity>
-                <Text style={{ fontSize: 17, fontWeight: '800', color: '#fff' }}>Leave Transporter Network</Text>
-                <View style={{ width: 38 }} />
-              </LinearGradient>
-              <ScrollView contentContainerStyle={{ padding: 20 }} showsVerticalScrollIndicator={false}>
-                <View style={{ backgroundColor: '#FFF3E0', borderRadius: 16, padding: 18, marginBottom: 24, alignItems: 'center', borderWidth: 1, borderColor: '#FFE0B2', gap: 10 }}>
-                  <Ionicons name="warning" size={32} color="#E65100" />
-                  <Text style={{ fontSize: 16, fontWeight: '800', color: '#E65100', textAlign: 'center' }}>This action is permanent</Text>
-                  <Text style={{ fontSize: 13, color: '#BF360C', textAlign: 'center', lineHeight: 20 }}>
-                    Leaving the network will permanently delete your account and all associated data including trip history, payments, and messages. You will need to re-register to join the service again.
-                  </Text>
-                </View>
-                <Text style={{ fontSize: 13, fontWeight: '700', color: '#374151', marginBottom: 8 }}>Confirm your email address</Text>
-                <TextInput
-                  style={{ backgroundColor: '#fff', borderWidth: 1.5, borderColor: '#C5D0C5', borderRadius: 12, padding: 14, fontSize: 14, color: '#1A2218', marginBottom: 20 }}
-                  placeholder="Enter your registered email"
-                  placeholderTextColor="#9CA3AF"
-                  value={leaveEmail}
-                  onChangeText={setLeaveEmail}
-                  keyboardType="email-address"
-                  autoCapitalize="none"
-                />
-                <TouchableOpacity
-                  style={[{ flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 10, backgroundColor: '#C62828', borderRadius: 14, paddingVertical: 16, marginBottom: 12 }, leaveLoading && { opacity: 0.6 }]}
-                  onPress={handleLeaveNetwork}
-                  disabled={leaveLoading}
-                  activeOpacity={0.85}
-                >
-                  {leaveLoading
-                    ? <ActivityIndicator size="small" color="#fff" />
-                    : <><Ionicons name="exit-outline" size={18} color="#fff" /><Text style={{ fontSize: 15, fontWeight: '800', color: '#fff' }}>Leave Network & Delete Account</Text></>}
-                </TouchableOpacity>
-                <TouchableOpacity style={{ alignItems: 'center', paddingVertical: 14 }} onPress={() => setLeaveNetworkVisible(false)} activeOpacity={0.75}>
-                  <Text style={{ fontSize: 14, fontWeight: '600', color: '#6B7280' }}>Cancel</Text>
-                </TouchableOpacity>
-              </ScrollView>
-            </View>
-          </KeyboardAvoidingView>
-        </Modal>
-
-        {/* ── Monthly Feedback Modal ─────────────────────────────────────── */}
-        <Modal visible={feedbackVisible} animationType="slide" presentationStyle="pageSheet" onRequestClose={() => { setFeedbackVisible(false); setFeedbackSubmitted(false); setFeedbackAnswers({}); setFeedbackSubject(''); }}>
-          <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : 'height'}>
-            <View style={{ flex: 1, backgroundColor: '#F5F7F5' }}>
-              <LinearGradient colors={[P.main, P.dark]} style={{ flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 16, paddingTop: Platform.OS === 'ios' ? 54 : 40, paddingBottom: 14 }}>
-                <TouchableOpacity onPress={() => { setFeedbackVisible(false); setFeedbackSubmitted(false); setFeedbackAnswers({}); setFeedbackSubject(''); }} style={{ width: 38, height: 38, borderRadius: 10, backgroundColor: 'rgba(255,255,255,0.15)', alignItems: 'center', justifyContent: 'center' }}>
-                  <Ionicons name="close" size={22} color={P.white} />
-                </TouchableOpacity>
-                <Text style={{ fontSize: 16, fontWeight: '800', color: '#fff', flex: 1, textAlign: 'center' }}>Monthly Feedback — {feedbackWindow.month}</Text>
-                <View style={{ width: 38 }} />
-              </LinearGradient>
-
-              {feedbackSubmitted ? (
-                <View style={{ flex: 1, alignItems: 'center', justifyContent: 'center', padding: 30 }}>
-                  <Ionicons name="checkmark-circle" size={52} color={P.main} />
-                  <Text style={{ fontSize: 22, fontWeight: '900', color: '#1A2218', marginTop: 16, marginBottom: 8 }}>Thank You!</Text>
-                  <Text style={{ fontSize: 14, color: '#6B7280', textAlign: 'center', lineHeight: 21 }}>Your feedback for {feedbackWindow.month} has been submitted. We appreciate your time.</Text>
-                  <TouchableOpacity style={{ marginTop: 24, backgroundColor: P.main, borderRadius: 12, paddingHorizontal: 30, paddingVertical: 13 }} onPress={() => { setFeedbackVisible(false); setFeedbackSubmitted(false); setFeedbackAnswers({}); setFeedbackSubject(''); }}>
-                    <Text style={{ fontSize: 15, fontWeight: '800', color: '#fff' }}>Close</Text>
-                  </TouchableOpacity>
-                </View>
-              ) : (
-                <ScrollView contentContainerStyle={{ padding: 18, paddingBottom: 40 }} showsVerticalScrollIndicator={false} keyboardShouldPersistTaps="handled">
-                  <View style={{ flexDirection: 'row', alignItems: 'flex-start', gap: 8, backgroundColor: '#E3F2FD', borderRadius: 10, padding: 12, marginBottom: 18, borderWidth: 1, borderColor: '#BBDEFB' }}>
-                    <Ionicons name="information-circle-outline" size={16} color="#1565C0" />
-                    <Text style={{ flex: 1, fontSize: 12, color: '#1565C0', fontWeight: '600' }}>Monthly feedback window is now open. Your response helps us improve the service.</Text>
-                  </View>
-                  <Text style={{ fontSize: 12, fontWeight: '700', color: '#374151', marginBottom: 6, marginTop: 4 }}>Subject *</Text>
-                  <TextInput
-                    style={{ backgroundColor: '#fff', borderWidth: 1.5, borderColor: '#C5D0C5', borderRadius: 11, paddingHorizontal: 14, paddingVertical: 12, fontSize: 14, color: '#1A2218', marginBottom: 16 }}
-                    value={feedbackSubject}
-                    onChangeText={setFeedbackSubject}
-                    placeholder={`e.g. ${feedbackWindow.month} Monthly Feedback`}
-                    placeholderTextColor="#9CA3AF"
-                  />
-                  {FEEDBACK_QUESTIONS.map((q, i) => (
-                    <View key={i} style={{ marginBottom: 16, backgroundColor: '#fff', borderRadius: 12, padding: 14, borderWidth: 1, borderColor: '#E5EBE5' }}>
-                      <Text style={{ fontSize: 13, fontWeight: '700', color: '#1A2218', marginBottom: 10, lineHeight: 19 }}>{i + 1}. {q}</Text>
-                      <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 6 }}>
-                        {RATING_OPTIONS.map(opt => (
-                          <TouchableOpacity
-                            key={opt}
-                            style={[{ paddingHorizontal: 10, paddingVertical: 7, backgroundColor: '#F5F7F5', borderRadius: 9, borderWidth: 1.5, borderColor: '#C5D0C5' }, feedbackAnswers[i] === opt && { backgroundColor: P.main, borderColor: P.main }]}
-                            onPress={() => setFeedbackAnswers(prev => ({ ...prev, [i]: opt }))}
-                            activeOpacity={0.75}
-                          >
-                            <Text style={[{ fontSize: 11, fontWeight: '600', color: '#374151' }, feedbackAnswers[i] === opt && { color: '#fff' }]}>{opt}</Text>
-                          </TouchableOpacity>
-                        ))}
-                      </View>
-                    </View>
-                  ))}
-                  <TouchableOpacity
-                    style={[{ flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, backgroundColor: P.main, borderRadius: 14, paddingVertical: 15, marginTop: 10 }, (feedbackSaving || !FEEDBACK_QUESTIONS.every((_, i) => feedbackAnswers[i])) && { opacity: 0.5 }]}
-                    onPress={handleFeedbackSubmit}
-                    disabled={feedbackSaving || !FEEDBACK_QUESTIONS.every((_, i) => feedbackAnswers[i])}
-                    activeOpacity={0.85}
-                  >
-                    {feedbackSaving
-                      ? <ActivityIndicator size="small" color="#fff" />
-                      : <><Ionicons name="send-outline" size={16} color="#fff" /><Text style={{ fontSize: 15, fontWeight: '800', color: '#fff' }}>Submit Feedback</Text></>}
-                  </TouchableOpacity>
-                </ScrollView>
-              )}
-            </View>
-          </KeyboardAvoidingView>
-        </Modal>
       </View>
     );
   }
