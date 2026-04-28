@@ -437,10 +437,7 @@ export default function AssignSection({ routes: propRoutes, onRefresh }) {
                 <View style={{ flex: 1, marginLeft: 10 }}>
                   <Text style={s.autoDetailTitle}>System Auto-Assigned</Text>
                   <Text style={s.autoDetailBody}>
-                    {'This route was created and assigned automatically at 12:00 AM because the manual pipeline was not completed.\n\n' +
-                     '✓ VRP optimizer ran on poll responses\n' +
-                     '✓ Nearest driver selected using Haversine formula\n' +
-                     '✓ Notifications sent to driver and passengers'}
+                    {'This route was created and assigned automatically at 12:00 AM because the manual pipeline was not completed.\n\n'}
                   </Text>
                   {route.autoProcessedAt && (
                     <Text style={s.autoDetailTime}>
