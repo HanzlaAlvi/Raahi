@@ -390,6 +390,14 @@ export default function RoutesScreen({
   const [driverId,           setDriverId]           = useState(null);
   const [countdown,          setCountdown]          = useState("");
 
+  // ── Route Merge state ─────────────────────────────────────────────────────
+  // mergeCandidate: the other driver's route info returned by the backend
+  const [mergeCandidate,    setMergeCandidate]    = useState(null);
+  // mergeAlertShown: flag so we only show the alert once per route session
+  const mergeAlertShownRef  = useRef(false);
+  // mergeCheckInProgress: prevents simultaneous API calls
+  const mergeCheckActiveRef = useRef(false);
+
   // ── Ride state ─────────────────────────────────────────────────────────────
   // PICKING_UP | GOING_TO_DESTINATION | COMPLETED
   const [rideState,        setRideState]        = useState("PICKING_UP");
@@ -457,6 +465,36 @@ export default function RoutesScreen({
       socket.on("passengerReady", (data) => {
         // This is handled by the parent DashboardScreen via passengerConfirmedForStop prop
         // but we can also update UI state here if needed
+      });
+
+      // ── Incoming merge request from another driver ─────────────────────────
+      // Another driver is heading to the same destination and wants to merge.
+      // We show an alert so THIS driver can accept and prepare to take passengers.
+      socket.on("routeMergeRequest", (data) => {
+        const { fromDriverName, destination, myEtaMin } = data || {};
+        Alert.alert(
+          "Incoming Route Merge Request \u{1F500}",
+          `Driver ${fromDriverName || "Another Driver"} is heading to ${destination || "the same destination"} and wants to merge routes.\n\nThey arrive in ~${myEtaMin || "?"} min.\n\nBe ready to take their passengers at the shared destination.`,
+          [
+            { text: "Decline", style: "cancel" },
+            {
+              text: "Accept & Be Ready",
+              onPress: () => {
+                Alert.alert(
+                  "Merge Accepted \u2705",
+                  `Coordinate with ${fromDriverName || "the other driver"} to transfer their passengers to your van.`,
+                  [{ text: "OK" }]
+                );
+                if (socketRef.current?.connected) {
+                  socketRef.current.emit("routeMergeAccepted", {
+                    fromRouteId: data?.toRouteId,
+                    toRouteId:   data?.fromRouteId,
+                  });
+                }
+              },
+            },
+          ]
+        );
       });
 
       socketRef.current = socket;
@@ -769,6 +807,108 @@ export default function RoutesScreen({
       setRideState("PICKING_UP");
     }
   }, [routeStarted]);
+
+
+  // ── Route Merge Check ─────────────────────────────────────────────────────
+  // When the driver has exactly 1 pickup stop remaining (i.e., they are one
+  // stop before finishing pickups and heading to destination), we call the
+  // backend to look for another in_progress route going to the same place.
+  // We only trigger once per route session and only if:
+  //   - The route is started
+  //   - We have a valid current location
+  //   - We have valid destination coordinates
+  //   - We have not already shown the alert this session
+  const pendingPickupCount = React.useMemo(() => {
+    return (rawStops || [])
+      .filter(s => s._isDriverOrigin !== true)
+      .filter(s => s.status !== "picked" && s.status !== "missed").length;
+  }, [rawStops]);
+
+  useEffect(() => {
+    if (!routeStarted) return;
+    if (mergeAlertShownRef.current) return;
+    if (mergeCheckActiveRef.current) return;
+    // Trigger when exactly 1 pickup stop remains (one stop before destination)
+    if (pendingPickupCount !== 1) return;
+    if (!currentLocation?.latitude || !currentLocation?.longitude) return;
+
+    const destLat = currentRoute?.dropOffLocation?.latitude
+      || currentRoute?.destinationLat
+      || currentRoute?.passengers?.[0]?.destinationLat;
+    const destLng = currentRoute?.dropOffLocation?.longitude
+      || currentRoute?.destinationLng
+      || currentRoute?.passengers?.[0]?.destinationLng;
+    if (!destLat || !destLng) return;
+
+    const routeId = currentRoute?._id;
+    if (!routeId) return;
+
+    mergeCheckActiveRef.current = true;
+
+    (async () => {
+      try {
+        const tok = authTokenRef?.current || driverToken;
+        const params = new URLSearchParams({
+          routeId,
+          destinationLat:  destLat,
+          destinationLng:  destLng,
+          driverLat:       currentLocation.latitude,
+          driverLng:       currentLocation.longitude,
+          remainingStops:  pendingPickupCount,
+          timeSlot:        currentRoute?.timeSlot || currentRoute?.pickupTime || "",
+        });
+        const r = await fetch(`${API_BASE}/routes/merge-candidate?${params}`, {
+          headers: { Authorization: `Bearer ${tok}` },
+        });
+        const data = await r.json();
+        if (data.success && data.candidate) {
+          mergeAlertShownRef.current = true;
+          setMergeCandidate(data.candidate);
+          Alert.alert(
+            "Route Merge Available 🔀",
+            `Driver ${data.candidate.driverName} is heading to the same destination (${data.candidate.destination}).
+
+Your ETA: ~${data.candidate.myEtaMin} min
+Their ETA: ~${data.candidate.otherEtaMin} min
+
+Would you like to coordinate with them? Your passengers can transfer to their van so neither driver has to wait long.`,
+            [
+              {
+                text: "Ignore",
+                style: "cancel",
+                onPress: () => setMergeCandidate(null),
+              },
+              {
+                text: "Coordinate Merge",
+                onPress: () => {
+                  // Emit a socket notification to the other driver
+                  if (socketRef.current?.connected) {
+                    socketRef.current.emit("routeMergeRequest", {
+                      fromRouteId:   currentRoute?._id,
+                      toRouteId:     data.candidate.routeId,
+                      fromDriverName: currentRoute?.driverName || "A Driver",
+                      destination:   data.candidate.destination,
+                      myEtaMin:      data.candidate.myEtaMin,
+                    });
+                  }
+                  Alert.alert(
+                    "Merge Request Sent ✅",
+                    `${data.candidate.driverName} has been notified. Coordinate at the next stop to transfer passengers. Complete your route when your passengers have boarded their van.`,
+                    [{ text: "OK" }]
+                  );
+                  setMergeCandidate(null);
+                },
+              },
+            ]
+          );
+        }
+      } catch (e) {
+        console.warn("[RouteMerge] check failed:", e.message);
+      } finally {
+        mergeCheckActiveRef.current = false;
+      }
+    })();
+  }, [pendingPickupCount, routeStarted]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Enrich stops ──────────────────────────────────────────────────────────
   const routeStops = (rawStops || [])
