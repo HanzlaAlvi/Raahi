@@ -199,6 +199,22 @@ async function fetchGoogleRoute(origin, waypoints, destination) {
   } catch { return null; }
 }
 
+// ─── OSRM free road-snapped polyline (fallback when Google fails) ──────────────
+async function fetchOsrmRoute(origin, waypoints, destination) {
+  try {
+    const coords = [origin, ...waypoints, destination]
+      .filter(c => c?.latitude && c?.longitude)
+      .map(c => `${c.longitude},${c.latitude}`)
+      .join(";");
+    const url = `https://router.project-osrm.org/route/v1/driving/${coords}?overview=full&geometries=geojson`;
+    const res  = await fetch(url);
+    const data = await res.json();
+    if (data.code !== "Ok") return null;
+    // Convert GeoJSON coords to {latitude, longitude} array
+    return data.routes?.[0]?.geometry?.coordinates?.map(([lng, lat]) => ({ latitude: lat, longitude: lng })) || null;
+  } catch { return null; }
+}
+
 // ─── Smooth animated marker ────────────────────────────────────────────────────
 function useAnimatedCoord(coord) {
   const latAnim = useRef(new Animated.Value(coord?.latitude  || 33.6844)).current;
@@ -668,44 +684,49 @@ export default function RoutesScreen({
       } catch {}
 
     } else {
-      // ── Google Directions failed (invalid key, quota, network) ─────────────
-      console.warn('[Driver] Google Directions FAILED — broadcasting straight-line fallback');
+      // ── Google Directions failed — try OSRM (free, no key needed) ──────────
+      console.warn('[Driver] Google Directions FAILED — trying OSRM road-snap fallback');
 
-      // Build a straight-line fallback using driver's LIVE location as origin
-      const fallbackCoords = [
-        { latitude: dLat, longitude: dLng },  // ← driver's LIVE position (not static home!)
+      const osrmCoords = await fetchOsrmRoute(
+        { latitude: dLat, longitude: dLng },
+        pickupWaypoints,
+        { latitude: Number(destLat), longitude: Number(destLng) }
+      );
+
+      const fallbackCoords = osrmCoords || [
+        { latitude: dLat, longitude: dLng },
         ...pickupWaypoints,
         { latitude: Number(destLat), longitude: Number(destLng) },
       ].filter(c => c?.latitude && c?.longitude);
 
-      // Update local map immediately with fallback
+      // Update local map immediately
       setPolylineCoords(fallbackCoords);
-      // Don't set encodedPolyline since we have no Google encoding
 
-      // Still broadcast the fallback so passengers/transporter get SOMETHING on their maps
+      // Broadcast fallback so passengers/transporter get SOMETHING on their maps
       const fallbackPayload = {
         rideId, routeId,
-        encodedPolyline: null,     // no Google encoding
-        waypointCoords:  fallbackCoords,  // raw straight-line coords
+        encodedPolyline: null,
+        waypointCoords:  fallbackCoords,
         dropOffLocation,
-        destination:    currentRoute.destination || dropOffLocation.name,
+        destination:    currentRoute.destination    || dropOffLocation.name,
         destinationLat: Number(destLat),
         destinationLng: Number(destLng),
-        driverName:     currentRoute.driverName || "Driver",
-        vehicleType:    currentRoute.vehicleType || "Van",
+        driverName:     currentRoute.driverName     || "Driver",
+        vehicleType:    currentRoute.vehicleType    || "Van",
         timestamp:      Date.now(),
       };
 
       if (socketRef.current?.connected) {
         socketRef.current.emit("routeUpdate", fallbackPayload);
         socketRef.current.emit("startRoute",  fallbackPayload);
-        console.log('[Driver] Straight-line fallback broadcast to passengers/transporter');
+        console.log('[Driver] OSRM/fallback polyline broadcast to passengers/transporter');
       } else {
         pendingBroadcastRef.current = fallbackPayload;
       }
 
-      // Reset flag so the system retries Google API on next significant movement
-      polylineSentRef.current = false;
+      // ✅ KEY FIX: Keep polylineSentRef=true so we don't spam every interval.
+      // Only re-trigger when driver moves ≥ 300m (handled by auto-refresh logic above).
+      polylineSentRef.current = true;
     }
   }, [routeStarted, currentRoute, currentLocation, routeStops, driverToken]);
 

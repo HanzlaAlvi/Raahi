@@ -184,6 +184,7 @@ export default function PassengerDashboard({ navigation }) {
 
   // Tracking state
   const [vanPos,              setVanPos]              = useState(null);
+  const [driverHomeCoord,     setDriverHomeCoord]     = useState(null); // driver's home/start position
   const [etaToMe,             setEtaToMe]             = useState(null);
   const [vanArrived,          setVanArrived]           = useState(false);
   const [boarded,             setBoarded]              = useState(false);
@@ -208,6 +209,13 @@ export default function PassengerDashboard({ navigation }) {
   const [boardingStopName,   setBoardingStopName]   = useState("");
   // Passenger tapped YES — waiting for driver to confirm
   const [passengerSaidYes,   setPassengerSaidYes]   = useState(false);
+
+  // ── "I'm Not Going" feature ───────────────────────────────────────────────
+  const [showNotGoingModal,  setShowNotGoingModal]  = useState(false);
+  const [notGoingLoading,    setNotGoingLoading]    = useState(false);
+  const [notGoingOffenses,   setNotGoingOffenses]   = useState(0);
+  const [notGoingDone,       setNotGoingDone]       = useState(false);
+
   // ── Smart Arrival Alert modal (in-app, no push) ───────────────────────────
   // Queue of { level, emoji, title, body } — dismiss one, next auto-shows
   const [arrivalAlertQueue,  setArrivalAlertQueue]  = useState([]);
@@ -603,6 +611,10 @@ export default function PassengerDashboard({ navigation }) {
           setEncodedPolyline(data.encodedPolyline);
           setUseLiveTripLocation(true);
         }
+        // ✅ FIX: Store driver home so van starts at correct position
+        if (data?.driverLat && data?.driverLng) {
+          setDriverHomeCoord({ latitude: Number(data.driverLat), longitude: Number(data.driverLng) });
+        }
         // Persist drop-off location from server payload
         if (data?.dropOffLocation) {
           setAssignedRoute(prev => prev ? {
@@ -711,7 +723,55 @@ export default function PassengerDashboard({ navigation }) {
     }
   };
 
+  // ── "I'm Not Going" handler ───────────────────────────────────────────────
+  const handleNotGoing = async () => {
+    if (notGoingLoading || notGoingDone) return;
+    setNotGoingLoading(true);
+    try {
+      const tok     = userTokenRef.current;
+      const routeId = assignedRoute?._id;
+      const myId    = userIdRef.current;
+      if (!tok || !routeId || !myId) throw new Error('Missing auth info');
+
+      const res  = await fetch(
+        `${API_BASE_URL}/routes/${routeId}/stops/${myId}/not-going`,
+        { method: 'PUT', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tok}` } }
+      );
+      const data = await res.json();
+      if (!data.success) throw new Error(data.message || 'Failed');
+
+      setNotGoingOffenses(data.offenseCount || 0);
+      setNotGoingDone(true);
+      setShowNotGoingModal(false);
+      setBoardingPending(false);
+      setVanArrived(false);
+
+      if (socketRef.current?.connected) {
+        const rideId = activeTripIdRef.current;
+        socketRef.current.emit('passengerNotGoing', {
+          rideId, routeId,
+          passengerId:  myId,
+          penaltyAmount: data.penaltyAmount,
+          offenseCount:  data.offenseCount,
+        });
+      }
+
+      Alert.alert(
+        '✅ Noted',
+        data.penaltyAmount > 0
+          ? `You have been marked as Not Going.\nA penalty of Rs. ${data.penaltyAmount} has been added to your account (Offense #${data.offenseCount}).`
+          : 'You have been marked as Not Going. The driver has been notified.',
+        [{ text: 'OK' }]
+      );
+    } catch (e) {
+      Alert.alert('Error', e.message || 'Could not process. Please try again.');
+    } finally {
+      setNotGoingLoading(false);
+    }
+  };
+
   // ── Local simulation fallback (when no live GPS) ───────────────────────────
+  // Simulation path: driverHome → stop1 → stop2 → ... → lastStop → destination
   const startPassengerSim = () => {
     clearInterval(simRef.current);
     const stops = buildStops();
@@ -721,6 +781,13 @@ export default function PassengerDashboard({ navigation }) {
     stepRef.current    = 0;
     alertedRef.current = false;
     setVanPos(stops[0].coordinate);
+
+    // Figure out which segment index corresponds to MY stop
+    // buildStops prepends driver-origin as index 0, so my actual stop
+    // in the stops array is myStopIndex + 1 (if driverHomeCoord exists)
+    const mySimIndex = (driverHomeCoord?.latitude && driverHomeCoord?.longitude)
+      ? myStopIndex + 1   // +1 because driver-origin is at index 0
+      : myStopIndex;
 
     simRef.current = setInterval(() => {
       const ss = stopsRef.current;
@@ -749,7 +816,8 @@ export default function PassengerDashboard({ navigation }) {
           stepRef.current = progress;
           return;
         }
-        if (seg === myStopIndex && !boarded) {
+        // When van arrives at MY stop segment (not boarded yet) → trigger boarding
+        if (seg === mySimIndex && !boarded) {
           setVanArrived(true);
           clearInterval(simRef.current);
           segRef.current  = seg;
@@ -762,9 +830,8 @@ export default function PassengerDashboard({ navigation }) {
       setVanPos(pos);
 
       // ETA to MY stop
-      const myIdx = myStopIndex;
-      if (myIdx >= 0 && myIdx < ss.length && seg < myIdx) {
-        const myCoord = ss[myIdx].coordinate;
+      if (mySimIndex >= 0 && mySimIndex < ss.length && seg < mySimIndex) {
+        const myCoord = ss[mySimIndex].coordinate;
         const dist    = haversine(pos.latitude, pos.longitude, myCoord.latitude, myCoord.longitude);
         const eta     = Math.max(1, Math.round((dist / SPEED_KMH) * 60));
         setEtaToMe(eta);
@@ -773,7 +840,7 @@ export default function PassengerDashboard({ navigation }) {
           alertedRef.current = true;
           Alert.alert(
             "🚨 Van is 10 Minutes Away!",
-            `Van will reach your stop in ~${eta} minute${eta === 1 ? "" : "s"}!\nGet ready at: ${ss[myIdx].name}`,
+            `Van will reach your stop in ~${eta} minute${eta === 1 ? "" : "s"}!\nGet ready at: ${ss[mySimIndex]?.name || "your stop"}`,
             [{ text: "Got it! I'm Ready! 👍" }]
           );
         }
@@ -784,8 +851,9 @@ export default function PassengerDashboard({ navigation }) {
     }, FRAME_MS);
   };
 
+  // buildStops: driver home → all passenger pickups → destination
   const buildStops = () => {
-    return (allPassengers || []).map((p, i) => {
+    const passengerStops = (allPassengers || []).map((p, i) => {
       const coord = resolvePassengerCoord(p, i);
       return {
         _id:           p._id?.toString() || `p-${i}`,
@@ -794,6 +862,35 @@ export default function PassengerDashboard({ navigation }) {
         coordinate:    coord,
       };
     });
+
+    // Resolve destination stop
+    const destLat = assignedRoute?.dropOffLocation?.latitude
+      || assignedRoute?.destinationLat
+      || allPassengers?.[0]?.destinationLat
+      || allPassengers?.[0]?.dropLat
+      || null;
+    const destLng = assignedRoute?.dropOffLocation?.longitude
+      || assignedRoute?.destinationLng
+      || allPassengers?.[0]?.destinationLng
+      || allPassengers?.[0]?.dropLng
+      || null;
+    const destName = assignedRoute?.dropOffLocation?.name
+      || assignedRoute?.destination
+      || "Destination";
+
+    const destStop = (destLat && destLng)
+      ? [{ _id: "destination", name: destName, passengerName: "Destination", coordinate: { latitude: Number(destLat), longitude: Number(destLng) } }]
+      : [];
+
+    // Prepend driver's home as origin so van starts there
+    if (driverHomeCoord?.latitude && driverHomeCoord?.longitude) {
+      return [
+        { _id: "driver-origin", name: "Driver Start", passengerName: "Driver", coordinate: driverHomeCoord },
+        ...passengerStops,
+        ...destStop,
+      ];
+    }
+    return [...passengerStops, ...destStop];
   };
 
   // ── Auth & data ────────────────────────────────────────────────────────────
@@ -847,6 +944,13 @@ export default function PassengerDashboard({ navigation }) {
         const passengers = route.passengers || [];
         setAllPassengers(passengers);
         setTotalPassengers(passengers.length);
+
+        // Store driver's home so van starts there, not at stop 1
+        const drvLat = route.driverLat ?? route.assignedDriverLat ?? null;
+        const drvLng = route.driverLng ?? route.assignedDriverLng ?? null;
+        if (drvLat && drvLng) {
+          setDriverHomeCoord({ latitude: Number(drvLat), longitude: Number(drvLng) });
+        }
 
         const myIdx   = passengers.findIndex(p =>
           (p.passengerId?.toString() || p._id?.toString()) === id
@@ -1270,7 +1374,7 @@ export default function PassengerDashboard({ navigation }) {
   const renderLiveMap = () => {
     if (!assignedRoute || assignedRoute.status !== "in_progress") return null;
 
-    const vanCoord = vanPos || (mapStops.length > 0 ? mapStops[0].coordinate : null);
+    const vanCoord = vanPos || driverHomeCoord || null;
     const allCoords = [
       ...mapStops.map(s => s.coordinate),
       ...dropStops.map(d => d.coordinate),
@@ -1793,6 +1897,24 @@ export default function PassengerDashboard({ navigation }) {
                 <Text style={{ color:"#fff", fontWeight:"900", fontSize:15 }}>NO, Not Yet</Text>
               </TouchableOpacity>
             </View>
+
+            {/* ── I'm Not Going Button ── */}
+            {!notGoingDone && (
+              <TouchableOpacity
+                style={{ marginTop:10, backgroundColor:"#DC2626", borderRadius:12, paddingVertical:12, alignItems:"center", flexDirection:"row", justifyContent:"center", gap:8 }}
+                onPress={() => setShowNotGoingModal(true)}
+                activeOpacity={0.85}
+              >
+                <Icon name="close-circle" size={20} color="#fff" />
+                <Text style={{ color:"#fff", fontWeight:"900", fontSize:15 }}>I'm NOT Going Today 🚫</Text>
+              </TouchableOpacity>
+            )}
+            {notGoingDone && (
+              <View style={{ marginTop:10, backgroundColor:"rgba(220,38,38,0.25)", borderRadius:12, paddingVertical:12, alignItems:"center", flexDirection:"row", justifyContent:"center", gap:8 }}>
+                <Icon name="close-circle" size={20} color="#fca5a5" />
+                <Text style={{ color:"#fca5a5", fontWeight:"900", fontSize:15 }}>Marked as Not Going ✓</Text>
+              </View>
+            )}
           </Animated.View>
         )}
 
@@ -2028,6 +2150,61 @@ export default function PassengerDashboard({ navigation }) {
           <Text style={{ color:"#fff", marginTop:10, fontSize:15 }}>Loading...</Text>
         </View>
       )}
+
+      {/* ── "I'm Not Going" Confirmation Modal ── */}
+      <Modal visible={showNotGoingModal} transparent animationType="fade" onRequestClose={() => setShowNotGoingModal(false)}>
+        <View style={{ flex:1, backgroundColor:"rgba(0,0,0,0.6)", justifyContent:"center", alignItems:"center", paddingHorizontal:24 }}>
+          <View style={{ backgroundColor:"#1E293B", borderRadius:20, padding:24, width:"100%", maxWidth:380 }}>
+            <View style={{ alignItems:"center", marginBottom:18 }}>
+              <View style={{ width:60, height:60, borderRadius:30, backgroundColor:"rgba(220,38,38,0.2)", alignItems:"center", justifyContent:"center", marginBottom:12 }}>
+                <Icon name="close-circle" size={36} color="#EF4444" />
+              </View>
+              <Text style={{ color:"#F1F5F9", fontSize:20, fontWeight:"900", textAlign:"center" }}>
+                Not Going Today?
+              </Text>
+              <Text style={{ color:"#94A3B8", fontSize:13, textAlign:"center", marginTop:6 }}>
+                This will notify your driver and mark you as absent.
+              </Text>
+            </View>
+            <View style={{ backgroundColor:"rgba(239,68,68,0.12)", borderRadius:14, padding:16, marginBottom:18, borderWidth:1, borderColor:"rgba(239,68,68,0.25)" }}>
+              <View style={{ flexDirection:"row", justifyContent:"space-between", marginBottom:8 }}>
+                <Text style={{ color:"#94A3B8", fontSize:13 }}>This will be your</Text>
+                <Text style={{ color:"#EF4444", fontSize:13, fontWeight:"800" }}>
+                  Offense #{notGoingOffenses + 1}
+                </Text>
+              </View>
+              <View style={{ flexDirection:"row", justifyContent:"space-between", marginBottom:4 }}>
+                <Text style={{ color:"#94A3B8", fontSize:13 }}>Penalty amount</Text>
+                <Text style={{ color:"#EF4444", fontSize:15, fontWeight:"900" }}>
+                  + Rs. {(notGoingOffenses + 1) * 50}
+                </Text>
+              </View>
+              <Text style={{ color:"#64748B", fontSize:11, marginTop:8, textAlign:"center" }}>
+                Penalty is added to your monthly payment to the transporter.
+              </Text>
+            </View>
+            <TouchableOpacity
+              style={{ backgroundColor:"#DC2626", borderRadius:12, paddingVertical:14, alignItems:"center", flexDirection:"row", justifyContent:"center", gap:8, marginBottom:10 }}
+              onPress={handleNotGoing}
+              disabled={notGoingLoading}
+              activeOpacity={0.85}
+            >
+              {notGoingLoading
+                ? <ActivityIndicator size="small" color="#fff" />
+                : <><Icon name="close-circle" size={20} color="#fff" /><Text style={{ color:"#fff", fontWeight:"900", fontSize:15 }}>Yes, I'm Not Going</Text></>
+              }
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={{ borderRadius:12, paddingVertical:13, alignItems:"center", backgroundColor:"rgba(255,255,255,0.08)" }}
+              onPress={() => setShowNotGoingModal(false)}
+              disabled={notGoingLoading}
+              activeOpacity={0.85}
+            >
+              <Text style={{ color:"#94A3B8", fontWeight:"700", fontSize:15 }}>Cancel — I'll Go</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
     </View>
   );
 }
