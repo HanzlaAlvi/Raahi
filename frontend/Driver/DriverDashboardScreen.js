@@ -452,6 +452,34 @@ export default function UnifiedDriverDashboard({ navigation }) {
         // Simulation stays paused — pickupPassenger() is the single resume gate.
       });
 
+      // ── passengerNotGoing — passenger said NO at boarding ──────────────────
+      // Auto-resume simulation: mark stop as missed and move to next stop.
+      // The passenger said they are not going today (penalty already applied).
+      socket.on("passengerNotGoing", (data) => {
+        const { passengerId, passengerName, penaltyAmount } = data || {};
+        if (!passengerId) return;
+        const idStr = passengerId?.toString();
+        console.log(`[Socket] passengerNotGoing: ${passengerName} (${idStr}) — auto-resuming simulation`);
+
+        // Mark this stop as missed in local route state
+        setRouteStops(prev => prev.map(s => {
+          const sid = s.passengerId?.toString() || s._id?.toString();
+          return sid === idStr ? { ...s, status: 'missed' } : s;
+        }));
+
+        // Auto-resume simulation — passenger is not boarding, van moves to next stop
+        if (simPausedRef.current) {
+          simPausedRef.current = false;
+          setWaitingAtStop(null);
+          setPassengerConfirmedForStop(null);
+          passengerConfirmedRef.current = null;
+          AsyncStorage.multiRemove([
+            PERSIST_WAITING_STOP, PERSIST_WAITING_ROUTE, PERSIST_PASSENGER_CONF,
+          ]).catch(() => {});
+          console.log('[Driver] Simulation resumed — passenger not going');
+        }
+      });
+
       socket.on("disconnect", reason => console.log("[Socket] Driver disconnected:", reason));
       socketRef.current = socket;
     } catch (e) {

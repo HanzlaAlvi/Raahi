@@ -7,6 +7,7 @@ const Route    = require('../models/Route');
 const Trip     = require('../models/Trip');
 const Poll     = require('../models/Poll');
 const User     = require('../models/User');
+const Payment  = require('../models/Payment');
 const DriverAvailability = require('../models/DriverAvailability');
 const auth     = require('../middleware/auth');
 const sendNotification   = require('../helpers/notification');
@@ -493,6 +494,89 @@ router.put('/:routeId/stops/:stopId/passenger-confirm', auth, async (req, res) =
     res.status(500).json({ success: false, message: err.message });
   }
 });
+
+
+// ═══════════════════════════════════════════════════════════════════
+// PUT /api/routes/:routeId/stops/:stopId/not-going
+// Passenger says "I am NOT going today" — applies escalating penalty
+// Penalty: 1st offense Rs 50, each subsequent +10 (1st=50, 2nd=60, 3rd=70 …)
+// ═══════════════════════════════════════════════════════════════════
+router.put('/:routeId/stops/:stopId/not-going', auth, async (req, res) => {
+  try {
+    const route = await Route.findById(req.params.routeId);
+    if (!route) return res.status(404).json({ success: false, message: 'Route not found' });
+
+    const pIdx = route.passengers.findIndex(
+      p => p._id?.toString()         === req.params.stopId ||
+           p.passengerId?.toString() === req.params.stopId
+    );
+    if (pIdx === -1) return res.status(404).json({ success: false, message: 'Passenger not found in route' });
+
+    const passengerEntry = route.passengers[pIdx];
+
+    route.passengers[pIdx].status   = 'missed';
+    route.passengers[pIdx].missedAt = new Date();
+    route.markModified('passengers');
+    await route.save();
+
+    let penaltyAmount = 0, newOffenseCount = 0;
+    const passUserId = passengerEntry.passengerId;
+
+    if (passUserId) {
+      const passengerUser = await User.findById(passUserId);
+      if (passengerUser) {
+        passengerUser.notGoingOffenses = (passengerUser.notGoingOffenses || 0) + 1;
+        newOffenseCount = passengerUser.notGoingOffenses;
+        await passengerUser.save();
+
+        // Penalty: Rs 50 for first offense, +Rs 10 for each subsequent offense
+        // offenseCount 1 -> 50, 2 -> 60, 3 -> 70, etc.
+        penaltyAmount = 50 + Math.max(0, newOffenseCount - 1) * 10;
+
+        const transporterId = route.transporterId || passengerUser.transporterId;
+        await new Payment({
+          type:          'penalty',
+          passengerId:   passUserId,
+          transporterId: transporterId,
+          amount:        penaltyAmount,
+          amountLabel:   `Not-Going Penalty (Offense #${newOffenseCount})`,
+          status:        'pending',
+          description:   `Passenger opted out at last minute. Offense #${newOffenseCount}. Penalty: Rs. ${penaltyAmount}`,
+          month:         new Date().toLocaleString('default', { month: 'long', year: 'numeric' }),
+          date:          new Date(),
+        }).save();
+      }
+    }
+
+    const trip = await Trip.findOne({ routeId: route._id });
+    const io   = req.app.get('io');
+    if (io) {
+      const payload = {
+        routeId:       route._id,
+        stopId:        req.params.stopId,
+        passengerId:   passUserId,
+        passengerName: passengerEntry.passengerName || passengerEntry.name || 'Passenger',
+        penaltyAmount,
+        offenseCount:  newOffenseCount,
+        stopIndex:     pIdx,
+      };
+      if (trip)            io.to(`ride_${trip._id}`).emit('passengerNotGoing', payload);
+      io.to(`route_${route._id}`).emit('passengerNotGoing', payload);
+      if (route.driverId)  io.to(`user_${route.driverId}`).emit('passengerNotGoing', payload);
+    }
+
+    return res.json({
+      success:      true,
+      penaltyAmount,
+      offenseCount: newOffenseCount,
+      message:      `Marked as not going. Penalty of Rs. ${penaltyAmount} added (Offense #${newOffenseCount}).`,
+    });
+  } catch (err) {
+    console.error('[not-going]', err);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 
 router.put('/:routeId/stops/:stopId/status', auth, async (req, res) => {
   try {

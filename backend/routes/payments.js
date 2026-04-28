@@ -233,6 +233,75 @@ router.get('/passenger/:passengerId', auth, async (req, res) => {
 // Also accepts an optional proofImage (base64 data URI or URL string) as proof.
 // After setting, the passenger is notified so they can see the plan and activate it.
 // STATIC — must be before /:id
+// ── GET /api/payments/penalties ─────────────────────────────────────────────
+// All passengers linked to this transporter with their penalty summary.
+// Returns: offenseCount (from User.notGoingOffenses), totalPenaltyAmount
+// (sum of Payment records with type='penalty'), and full penalty history.
+// STATIC — must be before /:id
+router.get('/penalties', auth, async (req, res) => {
+  try {
+    const transporterId = req.query.transporterId || req.userId;
+
+    // Get all passengers for this transporter
+    const passengers = await User.find({
+      $or: [{ role: 'passenger' }, { type: 'passenger' }],
+      transporterId,
+    }).select('name email phone pickupPoint notGoingOffenses').sort({ name: 1 }).lean();
+
+    const passengerIds = passengers.map(p => p._id);
+
+    // Fetch all penalty Payment records for these passengers
+    const penaltyPayments = await Payment.find({
+      passengerId: { $in: passengerIds },
+      type:        'penalty',
+    }).sort({ createdAt: -1 }).lean();
+
+    // Group penalty payments by passengerId
+    const penaltyMap = {};
+    for (const pay of penaltyPayments) {
+      const pid = pay.passengerId?.toString();
+      if (!pid) continue;
+      if (!penaltyMap[pid]) penaltyMap[pid] = { total: 0, records: [] };
+      penaltyMap[pid].total += pay.amount || 0;
+      penaltyMap[pid].records.push({
+        _id:         pay._id,
+        amount:      pay.amount,
+        description: pay.description,
+        status:      pay.status,
+        date:        pay.date || pay.createdAt,
+        month:       pay.month,
+      });
+    }
+
+    const result = passengers.map(p => {
+      const pid     = p._id.toString();
+      const pData   = penaltyMap[pid] || { total: 0, records: [] };
+      return {
+        _id:                p._id,
+        name:               p.name,
+        phone:              p.phone,
+        pickupPoint:        p.pickupPoint,
+        offenseCount:       p.notGoingOffenses || 0,
+        totalPenaltyAmount: pData.total,
+        penaltyHistory:     pData.records,
+      };
+    });
+
+    // Overall totals for header summary
+    const totalOffenses      = result.reduce((s, p) => s + p.offenseCount, 0);
+    const totalPenaltyAmount = result.reduce((s, p) => s + p.totalPenaltyAmount, 0);
+    const passengersWithPenalty = result.filter(p => p.offenseCount > 0).length;
+
+    res.json({
+      success: true,
+      passengers: result,
+      summary: { totalOffenses, totalPenaltyAmount, passengersWithPenalty },
+    });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 router.post('/set-passenger-amount', auth, async (req, res) => {
   try {
     const {

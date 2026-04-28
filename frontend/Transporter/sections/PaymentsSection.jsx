@@ -1,11 +1,10 @@
 // Transporter/sections/PaymentsSection.jsx
 //
-// CHANGES:
-//  - Passengers tab: transporter first sees ALL passengers list,
-//    can set amount per passenger manually, optionally attaches a
-//    proof screenshot (base64 from image picker), then saves.
-//    Passenger is notified and their Payment screen shows ONLY their amount.
-//  - Requests / Drivers tabs: unchanged from previous version.
+// CHANGES (Penalties tab added):
+//  - New "Penalties" tab fetches GET /api/payments/penalties and shows
+//    per-passenger offense count + total penalty amount + full penalty history.
+//  - Summary header now shows total penalty amount across all passengers.
+//  - All existing tabs (Requests, Passengers, Drivers) are completely unchanged.
 
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import {
@@ -43,6 +42,8 @@ const C = {
   infoBg:      '#E3F2FD',
   purple:      '#6A1B9A',
   purpleBg:    '#F3E5F5',
+  amber:       '#B45309',
+  amberBg:     '#FEF3C7',
 };
 
 const PAYMENT_METHODS = ['EasyPaisa', 'JazzCash', 'Bank Transfer', 'Cash', 'Other'];
@@ -81,7 +82,7 @@ const getAuth = async () => {
   } catch { return { token: null, transporterId: null }; }
 };
 
-// ── Stat tile (unchanged UI) ───────────────────────────────────────────────
+// ── Stat tile ─────────────────────────────────────────────────────────────────
 const StatTile = ({ icon, label, value, color, bg }) => (
   <View style={[s.statTile, { borderColor: color + '30' }]}>
     <View style={[s.statIconBox, { backgroundColor: bg }]}>
@@ -93,13 +94,117 @@ const StatTile = ({ icon, label, value, color, bg }) => (
 );
 
 const MAIN_TABS = [
-  { key: 'requests',   label: 'Requests',   icon: 'mail-outline'   },
-  { key: 'passengers', label: 'Passengers', icon: 'person-outline' },
-  { key: 'drivers',    label: 'Drivers',    icon: 'car-outline'    },
+  { key: 'requests',   label: 'Requests',   icon: 'mail-outline'      },
+  { key: 'passengers', label: 'Passengers', icon: 'person-outline'    },
+  { key: 'drivers',    label: 'Drivers',    icon: 'car-outline'       },
+  { key: 'penalties',  label: 'Penalties',  icon: 'warning-outline'   },
 ];
 
 // ══════════════════════════════════════════════════════════════════
-// SUBSCRIPTION REQUEST CARD  (pending → approve / reject)
+// PENALTY CARD  — shows per-passenger offense + amount summary
+// ══════════════════════════════════════════════════════════════════
+const PenaltyCard = ({ passenger, expanded, onToggle }) => {
+  const hasOffenses = passenger.offenseCount > 0;
+  const borderColor = hasOffenses ? C.danger : C.border;
+
+  return (
+    <View style={[s.card, { borderLeftColor: borderColor }]}>
+      {/* Header row — always visible */}
+      <TouchableOpacity
+        style={s.cardHeader}
+        onPress={onToggle}
+        activeOpacity={0.8}
+      >
+        <View style={[s.avatarBox, { backgroundColor: hasOffenses ? C.dangerBg : C.light }]}>
+          <Text style={[s.avatarTxt, { color: hasOffenses ? C.danger : C.main }]}>
+            {initials(passenger.name)}
+          </Text>
+        </View>
+
+        <View style={{ flex: 1, marginLeft: 10 }}>
+          <Text style={s.cardName}>{passenger.name || '—'}</Text>
+          {passenger.phone ? <Text style={s.cardSub}>{passenger.phone}</Text> : null}
+          {passenger.pickupPoint ? (
+            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 4, marginTop: 2 }}>
+              <Ionicons name="location-outline" size={11} color={C.main} />
+              <Text style={{ fontSize: 11, color: C.textLight }}>{passenger.pickupPoint}</Text>
+            </View>
+          ) : null}
+        </View>
+
+        {/* Right side: offense count + total */}
+        <View style={{ alignItems: 'flex-end', marginRight: 6 }}>
+          {hasOffenses ? (
+            <>
+              <View style={[s.badge, { backgroundColor: C.dangerBg, marginBottom: 4 }]}>
+                <Ionicons name="warning" size={11} color={C.danger} />
+                <Text style={[s.badgeTxt, { color: C.danger }]}>
+                  {passenger.offenseCount} offense{passenger.offenseCount !== 1 ? 's' : ''}
+                </Text>
+              </View>
+              <Text style={{ fontSize: 13, fontWeight: '800', color: C.danger }}>
+                {fmtPKR(passenger.totalPenaltyAmount)}
+              </Text>
+            </>
+          ) : (
+            <View style={[s.badge, { backgroundColor: C.successBg }]}>
+              <Ionicons name="checkmark-circle" size={11} color={C.success} />
+              <Text style={[s.badgeTxt, { color: C.success }]}>No Penalty</Text>
+            </View>
+          )}
+        </View>
+
+        <Ionicons
+          name={expanded ? 'chevron-up' : 'chevron-down'}
+          size={16}
+          color={C.textMuted}
+        />
+      </TouchableOpacity>
+
+      {/* Expanded: penalty history list */}
+      {expanded && (
+        <View style={{ marginTop: 6 }}>
+          {passenger.penaltyHistory.length === 0 ? (
+            <View style={{ paddingVertical: 10, alignItems: 'center' }}>
+              <Text style={{ fontSize: 12, color: C.textMuted }}>No penalty records</Text>
+            </View>
+          ) : (
+            <View style={s.payHistoryBox}>
+              <Text style={s.payHistoryTitle}>PENALTY HISTORY</Text>
+              {passenger.penaltyHistory.map((rec, idx) => (
+                <View key={rec._id?.toString() || idx} style={s.payHistoryItem}>
+                  <View style={{ flex: 1 }}>
+                    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 6, marginBottom: 2 }}>
+                      <Ionicons name="warning" size={12} color={C.danger} />
+                      <Text style={{ fontSize: 12, fontWeight: '700', color: C.danger }}>
+                        {fmtPKR(rec.amount)}
+                      </Text>
+                      <Text style={s.payHistDate}>{fmtDate(rec.date)}</Text>
+                    </View>
+                    {rec.description ? (
+                      <Text style={[s.payHistDesc, { marginTop: 2 }]}>{rec.description}</Text>
+                    ) : null}
+                    {rec.month ? (
+                      <Text style={{ fontSize: 10, color: C.textMuted, marginTop: 1 }}>{rec.month}</Text>
+                    ) : null}
+                  </View>
+                  <View style={[s.tinyBadge, { backgroundColor: C.dangerBg }]}>
+                    <Text style={[s.tinyBadgeTxt, { color: C.danger }]}>
+                      {rec.status || 'pending'}
+                    </Text>
+                  </View>
+                </View>
+              ))}
+            </View>
+          )}
+        </View>
+      )}
+    </View>
+  );
+};
+
+// ══════════════════════════════════════════════════════════════════
+// SUBSCRIPTION REQUEST CARD  (unchanged)
 // ══════════════════════════════════════════════════════════════════
 const RequestCard = ({ item, onApprove, onReject, processing }) => (
   <View style={[s.card, { borderLeftColor: C.warn }]}>
@@ -177,8 +282,7 @@ const RequestCard = ({ item, onApprove, onReject, processing }) => (
 );
 
 // ══════════════════════════════════════════════════════════════════
-// PASSENGER AMOUNT CARD
-// Shows each passenger and lets transporter set / update amount.
+// PASSENGER AMOUNT CARD  (unchanged)
 // ══════════════════════════════════════════════════════════════════
 const PassengerAmountCard = ({ passenger, onSetAmount }) => {
   const hasAmount = !!passenger.assignedAmount;
@@ -234,13 +338,12 @@ const PassengerAmountCard = ({ passenger, onSetAmount }) => {
 };
 
 // ══════════════════════════════════════════════════════════════════
-// SET PASSENGER AMOUNT MODAL
-// Transporter enters amount + optionally picks a screenshot as proof.
+// SET PASSENGER AMOUNT MODAL  (unchanged)
 // ══════════════════════════════════════════════════════════════════
 const SetPassengerAmountModal = ({ visible, passenger, onClose, onSaved }) => {
   const [amount,      setAmount]      = useState('');
   const [description, setDescription] = useState('');
-  const [proofImage,  setProofImage]  = useState(null);   // base64 URI
+  const [proofImage,  setProofImage]  = useState(null);
   const [saving,      setSaving]      = useState(false);
 
   useEffect(() => {
@@ -259,9 +362,9 @@ const SetPassengerAmountModal = ({ visible, passenger, onClose, onSaved }) => {
         return;
       }
       const result = await ImagePicker.launchImageLibraryAsync({
-        mediaTypes:  ImagePicker.MediaTypeOptions.Images,
-        quality:     0.6,
-        base64:      true,
+        mediaTypes:    ImagePicker.MediaTypeOptions.Images,
+        quality:       0.6,
+        base64:        true,
         allowsEditing: true,
       });
       if (!result.canceled && result.assets?.[0]) {
@@ -271,7 +374,7 @@ const SetPassengerAmountModal = ({ visible, passenger, onClose, onSaved }) => {
           : asset.uri;
         setProofImage(uri);
       }
-    } catch (err) {
+    } catch {
       Alert.alert('Error', 'Could not open image picker. Please try again.');
     }
   };
@@ -351,7 +454,6 @@ const SetPassengerAmountModal = ({ visible, passenger, onClose, onSaved }) => {
               multiline
             />
 
-            {/* Proof screenshot */}
             <Text style={s.inputLabel}>Proof Screenshot (optional)</Text>
             <TouchableOpacity
               style={[s.input, { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', backgroundColor: C.light }]}
@@ -400,7 +502,7 @@ const SetPassengerAmountModal = ({ visible, passenger, onClose, onSaved }) => {
 };
 
 // ══════════════════════════════════════════════════════════════════
-// DRIVER PAYMENT CARD  (unchanged from previous version)
+// DRIVER PAYMENT CARD  (unchanged)
 // ══════════════════════════════════════════════════════════════════
 const DriverPayCard = ({ driverData, onAddPayment, onMarkPaid, expandedId, setExpandedId }) => {
   const { driver, paymentStats, payments } = driverData;
@@ -502,7 +604,7 @@ const DriverPayCard = ({ driverData, onAddPayment, onMarkPaid, expandedId, setEx
 };
 
 // ══════════════════════════════════════════════════════════════════
-// SEND MONEY TO DRIVER MODAL (unchanged)
+// SEND MONEY TO DRIVER MODAL  (unchanged)
 // ══════════════════════════════════════════════════════════════════
 const AddDriverPaymentModal = ({ visible, driver, onClose, onSave }) => {
   const [amount,        setAmount]        = useState('');
@@ -693,7 +795,7 @@ const AddDriverPaymentModal = ({ visible, driver, onClose, onSave }) => {
 };
 
 // ══════════════════════════════════════════════════════════════════
-// MARK PAID MODAL (for existing driver payment records)
+// MARK PAID MODAL  (unchanged)
 // ══════════════════════════════════════════════════════════════════
 const MarkPaidModal = ({ visible, payment, driver, onClose, onConfirm }) => {
   const totalAmt    = payment?.amount || 0;
@@ -762,22 +864,25 @@ const MarkPaidModal = ({ visible, payment, driver, onClose, onConfirm }) => {
 const PaymentsSection = ({ stats = {}, refreshing: parentRefreshing, onRefresh: parentOnRefresh }) => {
   const [mainTab,        setMainTab]        = useState('requests');
 
-  // Requests state
   const [requests,       setRequests]       = useState([]);
   const [reqLoading,     setReqLoading]     = useState(true);
   const [processingMap,  setProcessingMap]  = useState({});
 
-  // Passengers state — list of ALL passengers with their assigned amounts
   const [passengers,     setPassengers]     = useState([]);
   const [pasLoading,     setPasLoading]     = useState(true);
-  const [setAmountFor,   setSetAmountFor]   = useState(null);   // passenger being edited
+  const [setAmountFor,   setSetAmountFor]   = useState(null);
 
-  // Drivers state
   const [driverData,     setDriverData]     = useState([]);
   const [drvLoading,     setDrvLoading]     = useState(true);
   const [expandedDriver, setExpandedDriver] = useState(null);
   const [addPayDriver,   setAddPayDriver]   = useState(null);
   const [markPayment,    setMarkPayment]    = useState(null);
+
+  // Penalties state
+  const [penaltyData,    setPenaltyData]    = useState([]);
+  const [penSummary,     setPenSummary]     = useState({ totalOffenses: 0, totalPenaltyAmount: 0, passengersWithPenalty: 0 });
+  const [penLoading,     setPenLoading]     = useState(true);
+  const [expandedPenId,  setExpandedPenId]  = useState(null);
 
   const [refreshing,     setRefreshing]     = useState(false);
 
@@ -788,7 +893,6 @@ const PaymentsSection = ({ stats = {}, refreshing: parentRefreshing, onRefresh: 
     return a;
   };
 
-  // ── Fetch: pending subscription requests ──────────────────────
   const fetchRequests = useCallback(async () => {
     try {
       const { token, transporterId } = await loadAuth();
@@ -805,7 +909,6 @@ const PaymentsSection = ({ stats = {}, refreshing: parentRefreshing, onRefresh: 
     }
   }, []);
 
-  // ── Fetch: all passengers with assigned amounts ───────────────
   const fetchPassengers = useCallback(async () => {
     try {
       const { token, transporterId } = await loadAuth();
@@ -822,7 +925,6 @@ const PaymentsSection = ({ stats = {}, refreshing: parentRefreshing, onRefresh: 
     }
   }, []);
 
-  // ── Fetch: driver list + payment records ──────────────────────
   const fetchDriverPayments = useCallback(async () => {
     try {
       const { token, transporterId } = await loadAuth();
@@ -839,16 +941,35 @@ const PaymentsSection = ({ stats = {}, refreshing: parentRefreshing, onRefresh: 
     }
   }, []);
 
+  // Fetch penalty data from the new endpoint
+  const fetchPenalties = useCallback(async () => {
+    try {
+      const { token, transporterId } = await loadAuth();
+      if (!token || !transporterId) return;
+      const res  = await fetch(`${API_BASE}/payments/penalties?transporterId=${transporterId}`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const data = await res.json();
+      if (data.success) {
+        setPenaltyData(data.passengers || []);
+        setPenSummary(data.summary || { totalOffenses: 0, totalPenaltyAmount: 0, passengersWithPenalty: 0 });
+      }
+    } catch (err) {
+      console.error('[PaymentsSection] fetchPenalties:', err?.message);
+    } finally {
+      setPenLoading(false);
+    }
+  }, []);
+
   const loadAll = useCallback(async () => {
     setRefreshing(true);
-    await Promise.all([fetchRequests(), fetchPassengers(), fetchDriverPayments()]);
+    await Promise.all([fetchRequests(), fetchPassengers(), fetchDriverPayments(), fetchPenalties()]);
     setRefreshing(false);
     if (parentOnRefresh) parentOnRefresh();
-  }, [fetchRequests, fetchPassengers, fetchDriverPayments]);
+  }, [fetchRequests, fetchPassengers, fetchDriverPayments, fetchPenalties]);
 
   useEffect(() => { loadAll(); }, []);
 
-  // ── Approve subscription ──────────────────────────────────────
   const handleApprove = useCallback(async (item) => {
     Alert.alert(
       'Approve Subscription',
@@ -884,7 +1005,6 @@ const PaymentsSection = ({ stats = {}, refreshing: parentRefreshing, onRefresh: 
     );
   }, []);
 
-  // ── Reject subscription ───────────────────────────────────────
   const handleReject = useCallback(async (item) => {
     Alert.alert(
       'Reject Subscription',
@@ -920,7 +1040,6 @@ const PaymentsSection = ({ stats = {}, refreshing: parentRefreshing, onRefresh: 
     );
   }, []);
 
-  // ── Add driver payment record ─────────────────────────────────
   const handleAddDriverPayment = useCallback(async (payData) => {
     const { token, transporterId } = authRef.current;
     const driver = addPayDriver;
@@ -957,7 +1076,6 @@ const PaymentsSection = ({ stats = {}, refreshing: parentRefreshing, onRefresh: 
     }
   }, [addPayDriver, fetchDriverPayments]);
 
-  // ── Mark driver payment as paid ───────────────────────────────
   const handleMarkDriverPaid = useCallback(async (payment, paidNow) => {
     const { token } = authRef.current;
     const newPaidTotal = (payment.paidAmount || 0) + paidNow;
@@ -980,7 +1098,9 @@ const PaymentsSection = ({ stats = {}, refreshing: parentRefreshing, onRefresh: 
     }
   }, [fetchDriverPayments]);
 
-  // ── RENDER ────────────────────────────────────────────────────
+  // Passengers with at least one offense — shown first on Penalties tab
+  const sortedPenaltyData = [...penaltyData].sort((a, b) => b.offenseCount - a.offenseCount);
+
   return (
     <View style={{ flex: 1, backgroundColor: C.bg }}>
 
@@ -1000,6 +1120,15 @@ const PaymentsSection = ({ stats = {}, refreshing: parentRefreshing, onRefresh: 
             <Ionicons name="car-outline" size={13} color="#80DEEA" />
             <Text style={s.summaryChipTxt}>{driverData.length} Drivers</Text>
           </View>
+          {/* Penalty summary chip — only shows if there are offenses */}
+          {penSummary.totalOffenses > 0 ? (
+            <View style={[s.summaryChip, { backgroundColor: 'rgba(198,40,40,0.3)' }]}>
+              <Ionicons name="warning" size={13} color="#EF9A9A" />
+              <Text style={[s.summaryChipTxt, { color: '#EF9A9A' }]}>
+                {fmtPKR(penSummary.totalPenaltyAmount)} fines
+              </Text>
+            </View>
+          ) : null}
         </View>
       </LinearGradient>
 
@@ -1018,6 +1147,11 @@ const PaymentsSection = ({ stats = {}, refreshing: parentRefreshing, onRefresh: 
             </Text>
             {tab.key === 'requests' && requests.length > 0 ? (
               <View style={s.tabBadge}><Text style={s.tabBadgeTxt}>{requests.length}</Text></View>
+            ) : null}
+            {tab.key === 'penalties' && penSummary.passengersWithPenalty > 0 ? (
+              <View style={[s.tabBadge, { backgroundColor: C.danger }]}>
+                <Text style={s.tabBadgeTxt}>{penSummary.passengersWithPenalty}</Text>
+              </View>
             ) : null}
           </TouchableOpacity>
         ))}
@@ -1050,7 +1184,7 @@ const PaymentsSection = ({ stats = {}, refreshing: parentRefreshing, onRefresh: 
             />
       ) : null}
 
-      {/* TAB: PASSENGERS — set amount per passenger */}
+      {/* TAB: PASSENGERS */}
       {mainTab === 'passengers' ? (
         pasLoading
           ? <View style={s.centered}><ActivityIndicator size="large" color={C.main} /></View>
@@ -1111,7 +1245,74 @@ const PaymentsSection = ({ stats = {}, refreshing: parentRefreshing, onRefresh: 
             />
       ) : null}
 
-      {/* Modals */}
+      {/* TAB: PENALTIES */}
+      {mainTab === 'penalties' ? (
+        penLoading
+          ? <View style={s.centered}><ActivityIndicator size="large" color={C.main} /></View>
+          : <>
+              {/* Penalty summary banner */}
+              {penSummary.totalOffenses > 0 ? (
+                <View style={s.penaltySummaryBar}>
+                  <View style={s.penaltySumChip}>
+                    <Ionicons name="warning" size={15} color={C.danger} />
+                    <View>
+                      <Text style={s.penaltySumValue}>{penSummary.totalOffenses}</Text>
+                      <Text style={s.penaltySumLabel}>Total Offenses</Text>
+                    </View>
+                  </View>
+                  <View style={[s.penaltySumChip, { flex: 1.4 }]}>
+                    <Ionicons name="cash-outline" size={15} color={C.danger} />
+                    <View>
+                      <Text style={s.penaltySumValue}>{fmtPKR(penSummary.totalPenaltyAmount)}</Text>
+                      <Text style={s.penaltySumLabel}>Total Penalties Charged</Text>
+                    </View>
+                  </View>
+                  <View style={s.penaltySumChip}>
+                    <Ionicons name="people" size={15} color={C.danger} />
+                    <View>
+                      <Text style={s.penaltySumValue}>{penSummary.passengersWithPenalty}</Text>
+                      <Text style={s.penaltySumLabel}>Passengers Fined</Text>
+                    </View>
+                  </View>
+                </View>
+              ) : null}
+
+              <FlatList
+                data={sortedPenaltyData}
+                keyExtractor={item => item._id?.toString()}
+                contentContainerStyle={s.listContent}
+                refreshControl={<RefreshControl refreshing={refreshing} onRefresh={loadAll} colors={[C.main]} tintColor={C.main} />}
+                ListHeaderComponent={
+                  <View style={{ backgroundColor: C.amberBg, borderRadius: 12, padding: 12, marginBottom: 10, flexDirection: 'row', gap: 8, alignItems: 'flex-start', borderWidth: 1, borderColor: C.amber + '40' }}>
+                    <Ionicons name="information-circle-outline" size={16} color={C.amber} />
+                    <Text style={{ flex: 1, fontSize: 12, color: C.amber, lineHeight: 18, fontWeight: '600' }}>
+                      Passengers who said "I'm Not Going" at the last minute are fined automatically.
+                      First offense: Rs. 50 · Each subsequent: +Rs. 10 more.
+                      Tap a passenger to see their full penalty history.
+                    </Text>
+                  </View>
+                }
+                ListEmptyComponent={
+                  <View style={s.emptyBox}>
+                    <Ionicons name="shield-checkmark-outline" size={52} color={C.border} />
+                    <Text style={s.emptyTitle}>No Penalties Yet</Text>
+                    <Text style={s.emptySubtitle}>No passengers have been fined for last-minute cancellations.</Text>
+                  </View>
+                }
+                renderItem={({ item }) => (
+                  <PenaltyCard
+                    passenger={item}
+                    expanded={expandedPenId === item._id?.toString()}
+                    onToggle={() => setExpandedPenId(
+                      expandedPenId === item._id?.toString() ? null : item._id?.toString()
+                    )}
+                  />
+                )}
+              />
+            </>
+      ) : null}
+
+      {/* Modals (unchanged) */}
       <SetPassengerAmountModal
         visible={!!setAmountFor}
         passenger={setAmountFor}
@@ -1148,17 +1349,26 @@ const s = StyleSheet.create({
     }),
   },
   summaryLabel:    { fontSize: 13, color: 'rgba(255,255,255,0.8)', fontWeight: '700', marginBottom: 10 },
-  summaryRow:      { flexDirection: 'row', gap: 6 },
+  summaryRow:      { flexDirection: 'row', gap: 6, flexWrap: 'wrap' },
   summaryChip:     { flex: 1, flexDirection: 'row', alignItems: 'center', gap: 4, backgroundColor: 'rgba(255,255,255,0.15)', borderRadius: 9, paddingHorizontal: 7, paddingVertical: 7 },
   summaryChipTxt:  { fontSize: 10, color: '#fff', fontWeight: '600', flex: 1 },
 
   tabBar:          { flexDirection: 'row', marginHorizontal: 14, marginBottom: 10, backgroundColor: C.light, borderRadius: 14, padding: 4, gap: 3 },
   tabBtn:          { flex: 1, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 5, paddingVertical: 9, borderRadius: 11 },
   tabBtnActive:    { backgroundColor: C.main },
-  tabBtnTxt:       { fontSize: 12, fontWeight: '600', color: C.textLight },
+  tabBtnTxt:       { fontSize: 11, fontWeight: '600', color: C.textLight },
   tabBtnTxtActive: { color: C.white },
   tabBadge:        { backgroundColor: C.warn, borderRadius: 8, minWidth: 16, height: 16, alignItems: 'center', justifyContent: 'center', paddingHorizontal: 4 },
   tabBadgeTxt:     { fontSize: 9, color: C.white, fontWeight: '800' },
+
+  // Penalty summary bar
+  penaltySummaryBar: {
+    flexDirection: 'row', gap: 8, marginHorizontal: 14, marginBottom: 8,
+    backgroundColor: C.dangerBg, borderRadius: 14, padding: 12, borderWidth: 1, borderColor: C.danger + '30',
+  },
+  penaltySumChip:  { flex: 1, flexDirection: 'row', alignItems: 'center', gap: 8 },
+  penaltySumValue: { fontSize: 14, fontWeight: '800', color: C.danger },
+  penaltySumLabel: { fontSize: 9, color: C.danger, fontWeight: '600', opacity: 0.8 },
 
   statGrid:        { flexDirection: 'row', gap: 10, marginHorizontal: 14, marginBottom: 10 },
   statTile: {
@@ -1227,7 +1437,6 @@ const s = StyleSheet.create({
   emptyTitle:      { fontSize: 16, fontWeight: '800', color: C.textDark, marginTop: 14, marginBottom: 6 },
   emptySubtitle:   { fontSize: 13, color: C.textMuted, textAlign: 'center' },
 
-  // Modal
   modalOverlay:    { flex: 1, backgroundColor: 'rgba(0,0,0,0.5)', justifyContent: 'flex-end' },
   modalBox:        { backgroundColor: C.white, borderTopLeftRadius: 24, borderTopRightRadius: 24, padding: 22, maxHeight: '92%' },
   modalHeader:     { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 18 },

@@ -398,6 +398,18 @@ module.exports = function attachSocket(io) {
       io.to(`ride_${rideId}`).emit('tenMinAlert', data);
     });
 
+    // ── PASSENGER: NOT GOING ─────────────────────────────────────────────────
+    // Passenger pressed 'NO, I'm Not Going' during boarding confirmation.
+    // The HTTP route already emits this server-side. We also forward the
+    // client-emitted copy so the driver receives it immediately.
+    socket.on('passengerNotGoing', (data) => {
+      const { rideId, routeId, passengerId } = data || {};
+      if (!rideId || !passengerId) return;
+      // Forward to all in the ride room (driver + transporter)
+      socket.to(`ride_${rideId}`).emit('passengerNotGoing', data);
+      if (routeId) io.to(`route_${routeId}`).emit('passengerNotGoing', data);
+    });
+
     // ── GENERIC: rideUpdated — broadcast any state/location/polyline change ─
     /**
      * Payload: { rideId, routeId, encodedPolyline?, dropOffLocation?, ...rest }
