@@ -1,1877 +1,2283 @@
-// frontend/Driver/DriverDashboardScreen.js
+// frontend/Passenger/src/screens/dashboard/PassengerDashboard.js
+// MERGED VERSION:
+//   ✅ All File 1 functionality preserved (polls, morning conf, notifications, chat, driver card, route status card, etc.)
+//   ✅ File 2 map improvements: encoded polyline reuse, smooth animated van, destination name fix
+//   ✅ File 2 boarding: dual-confirm flow (boardingPending + passengerConfirmBoarding socket event)
+//   ✅ File 2 socket: rideStateChange → GOING_TO_DESTINATION banner, bothConfirmed, joinRide/joinUser
+//   ✅ File 2 reconnection: re-join all rooms on socket reconnect
+//   ✅ vanArrived + boardingPending persistence via AsyncStorage
+//   ✅ Call feature remains removed (as in File 1)
 
-import React, { useState, useEffect, useRef, useCallback } from "react";
+import React, { useState, useEffect, useRef, useMemo } from "react";
 import {
-  View, Text, TouchableOpacity, ScrollView,
-  Alert, ActivityIndicator, StatusBar,
-  StyleSheet, Platform, Animated,
+  View, Text, TouchableOpacity, ScrollView, Animated,
+  Modal, TextInput, FlatList, KeyboardAvoidingView,
+  Platform, Alert, RefreshControl, ActivityIndicator, StyleSheet,
 } from "react-native";
-import { Ionicons }       from "@expo/vector-icons";
+import Icon from "react-native-vector-icons/Ionicons";
+import MapView, { Marker, Polyline, PROVIDER_GOOGLE } from "react-native-maps";
 import { LinearGradient } from "expo-linear-gradient";
-import AsyncStorage       from "@react-native-async-storage/async-storage";
-import { stopCoordinates } from "../constants/coordinates"; // named pickup point → lat/lng lookup
-import {
-  getMessaging,
-  onMessage,
-  onNotificationOpenedApp,
-  getInitialNotification,
-  setBackgroundMessageHandler,
-  requestPermission,
-  getToken,
-  AuthorizationStatus,
-} from "@react-native-firebase/messaging";
-import * as Location from 'expo-location';
+import AsyncStorage from "@react-native-async-storage/async-storage";
+import { stopCoordinates } from "../../../../constants/coordinates";
 
-import DashboardScreen     from "./screens/DashboardScreen";
-import AvailabilityScreen  from "./screens/Availabilityscreen";
-import RoutesScreen        from "./screens/RoutesScreen";
-import HistoryScreen       from "./screens/HistoryScreen";
-import PaymentsScreen      from "./screens/PaymentsScreen";
-import SupportScreen       from "./screens/SupportScreen";
-import NotificationsScreen from "./screens/NotificationsScreen";
-import DriverProfileScreen   from "./screens/DriverProfileScreen";
-import DriverChatModal       from "./components/DriverChatModal";
-import MonthlyFeedbackScreen from "./screens/MonthlyFeedbackScreen";
-import LeaveNetworkScreen    from "./screens/LeaveNetworkScreen";
-import DeleteAccountScreen   from "./screens/DeleteAccountScreen";
+const API_BASE_URL = "https://raahi-q2ur.onrender.com/api";
+const SOCKET_URL   = "https://raahi-q2ur.onrender.com";
 
-// ── Persistence keys for pickup confirmation state ─────────────────────────
-const PERSIST_WAITING_STOP    = "driver_waitingAtStop";
-const PERSIST_WAITING_ROUTE   = "driver_waitingRouteId";
-const PERSIST_PASSENGER_CONF  = "driver_passengerConfirmed";
-const PERSIST_ROUTE_STARTED   = "driver_routeStarted";
-const PERSIST_ACTIVE_TRIP     = "driver_activeTripId";
-// Simulation position keys — survive logout/login on same device
-const PERSIST_SIM_SEGMENT  = "driver_simSegment";
-const PERSIST_SIM_PROGRESS = "driver_simProgress";
-const PERSIST_SIM_LAT      = "driver_simLat";
-const PERSIST_SIM_LNG      = "driver_simLng";
+// ── Persistence keys ────────────────────────────────────────────────────────
+const PKEY_VAN_ARRIVED  = "passenger_vanArrived";
+const PKEY_VAN_STOP_ID  = "passenger_vanStopId";
+const PKEY_VAN_ROUTE_ID = "passenger_vanRouteId";
 
-// ─── Constants ────────────────────────────────────────────────────────────────
-const API_BASE_URL      = "https://raahi-q2ur.onrender.com/api";
-const SOCKET_URL        = "https://raahi-q2ur.onrender.com";
-const STATUS_BAR_H      = Platform.OS === "android" ? (StatusBar.currentHeight || 24) : 0;
-const SIM_INTERVAL_MS   = 1500;
-const ASSUMED_SPEED_KMH = 35;
-const TEN_MIN_KM        = (ASSUMED_SPEED_KMH * 10) / 60; // ~5.83 km
-const FIVE_MIN_KM       = (ASSUMED_SPEED_KMH *  5) / 60; // ~2.92 km
-const THREE_MIN_KM      = (ASSUMED_SPEED_KMH *  3) / 60; // ~1.75 km
-const ONE_MIN_KM        = (ASSUMED_SPEED_KMH *  1) / 60; // ~0.58 km
-const SOCKET_EMIT_MS    = 3000;
+const C = {
+  main:"#415844", dark:"#2D3E2F", deeper:"#1A2B1C",
+  light:"#EDF4ED", bg:"#F2F5F2", border:"#C5D4C5", white:"#FFFFFF", ink:"#0F1A10",
+  pollBg:"#2A4A2C",    pollBorder:"#4A7A4C",    pollAccent:"#7EC87F",
+  morningBg:"#3A3A1A", morningBorder:"#6A6A2A", morningAccent:"#C8C850",
+  notifBg:"#1A2E3A",   notifBorder:"#2A5A6A",   notifAccent:"#6AB8C8",
+  urgentBg:"#3A1A1A",  urgentBorder:"#6A2A2A",  urgentAccent:"#E87878",
+  offWhite:"rgba(255,255,255,0.92)", dimWhite:"rgba(255,255,255,0.60)",
+  success:"#4CAF50", warn:"#E59A2A", warnBg:"#FFF8E1", amber:"#FF9800",
+  info:"#1565C0", infoBg:"#E3F2FD", blue:"#2563EB",
+};
 
-// ─── Utilities ────────────────────────────────────────────────────────────────
-function haversineKm(lat1, lng1, lat2, lng2) {
-  const R  = 6371;
-  const dL = ((lat2 - lat1) * Math.PI) / 180;
-  const dl = ((lng2 - lng1) * Math.PI) / 180;
-  const a  = Math.sin(dL / 2) ** 2 +
-             Math.cos((lat1 * Math.PI) / 180) *
-             Math.cos((lat2 * Math.PI) / 180) *
-             Math.sin(dl / 2) ** 2;
+const SPEED_KMH = 40;
+const FRAME_MS  = 1000;
+
+const DEMO = [
+  { latitude: 33.6884, longitude: 73.0512 },
+  { latitude: 33.6941, longitude: 73.0389 },
+  { latitude: 33.7014, longitude: 73.0287 },
+  { latitude: 33.7104, longitude: 73.0192 },
+  { latitude: 33.7214, longitude: 73.0072 },
+];
+
+// ── Decode Google encoded polyline ──────────────────────────────────────────
+function decodePolyline(encoded) {
+  if (!encoded) return [];
+  const poly = [];
+  let index = 0, lat = 0, lng = 0;
+  while (index < encoded.length) {
+    let b, shift = 0, result = 0;
+    do { b = encoded.charCodeAt(index++) - 63; result |= (b & 0x1f) << shift; shift += 5; } while (b >= 0x20);
+    const dlat = result & 1 ? ~(result >> 1) : result >> 1; lat += dlat;
+    shift = 0; result = 0;
+    do { b = encoded.charCodeAt(index++) - 63; result |= (b & 0x1f) << shift; shift += 5; } while (b >= 0x20);
+    const dlng = result & 1 ? ~(result >> 1) : result >> 1; lng += dlng;
+    poly.push({ latitude: lat / 1e5, longitude: lng / 1e5 });
+  }
+  return poly;
+}
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+function haversine(la1, ln1, la2, ln2) {
+  const R = 6371, d2r = Math.PI / 180;
+  const dL = (la2 - la1) * d2r, dl = (ln2 - ln1) * d2r;
+  const a  = Math.sin(dL / 2) ** 2 + Math.cos(la1 * d2r) * Math.cos(la2 * d2r) * Math.sin(dl / 2) ** 2;
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
-function interpolate(from, to, t) {
+function resolvePassengerCoord(p, fallbackIndex = 0) {
+  const lat = p.pickupLat || p.latitude  || p.location?.coordinates?.[1] || null;
+  const lng = p.pickupLng || p.longitude || p.location?.coordinates?.[0] || null;
+  if (lat && lng && (Math.abs(lat - 33.6844) > 0.0001 || Math.abs(lng - 73.0479) > 0.0001))
+    return { latitude: Number(lat), longitude: Number(lng) };
+  const key = p.pickupPoint || p.pickupAddress || p.address || p.name || "";
+  if (key && stopCoordinates?.[key]) return stopCoordinates[key];
+  return DEMO[fallbackIndex % DEMO.length];
+}
+
+function resolveDropCoord(p) {
+  // Priority 1: dropOffLocation object (backend canonical field)
+  if (p.dropOffLocation?.latitude && p.dropOffLocation?.longitude)
+    return { latitude: Number(p.dropOffLocation.latitude), longitude: Number(p.dropOffLocation.longitude) };
+  // Priority 2: destinationLat / destinationLng
+  const lat = p.destinationLat || p.dropLat || null;
+  const lng = p.destinationLng || p.dropLng || null;
+  if (lat && lng && (Math.abs(lat - 33.6844) > 0.0001 || Math.abs(lng - 73.0479) > 0.0001))
+    return { latitude: Number(lat), longitude: Number(lng) };
+  // Priority 3: named stop lookup
+  const key = p.destination || p.dropAddress || p.dropOffLocation?.name || p.dropOffLocation?.address || "";
+  if (key && stopCoordinates?.[key]) return stopCoordinates[key];
+  return null;
+}
+
+// ── DESTINATION NAME FIX: use place name, not passenger name ─────────────────
+function resolveDestinationName(p) {
+  const name = p.dropOffLocation?.name || p.dropOffLocation?.address
+    || p.destination || p.dropAddress || p.destinationName || null;
+  if (name && name.trim() && name !== p.name && name !== p.passengerName) return name;
+  return "Drop-off";
+}
+
+function lerp(a, b, t) {
   return {
-    latitude:  from.latitude  + (to.latitude  - from.latitude)  * t,
-    longitude: from.longitude + (to.longitude - from.longitude) * t,
+    latitude:  a.latitude  + (b.latitude  - a.latitude)  * t,
+    longitude: a.longitude + (b.longitude - a.longitude) * t,
   };
 }
 
-// ── resolveCoord ────────────────────────────────────────────────────────────
-// Returns {latitude, longitude} for a passenger stop using:
-//   1. Explicit lat/lng from DB (most accurate)
-//   2. Named pickup point lookup from stopCoordinates map
-//   3. DEMO fallback (so map always shows something)
-function resolveCoord(p, fallbackIndex = 0) {
-  const DEMO_COORDS = [
-    { latitude: 33.6884, longitude: 73.0512 },
-    { latitude: 33.6941, longitude: 73.0389 },
-    { latitude: 33.7014, longitude: 73.0287 },
-    { latitude: 33.7104, longitude: 73.0192 },
-    { latitude: 33.7214, longitude: 73.0072 },
-  ];
-  const lat = p.pickupLat || p.latitude  || p.location?.coordinates?.[1] || null;
-  const lng = p.pickupLng || p.longitude || p.location?.coordinates?.[0] || null;
-  // Valid non-default coordinate
-  if (lat && lng && (Math.abs(lat - 33.6844) > 0.0001 || Math.abs(lng - 73.0479) > 0.0001)) {
-    return { latitude: Number(lat), longitude: Number(lng) };
-  }
-  // Named stop lookup from constants/coordinates.js
-  const key = p.pickupPoint || p.pickupAddress || p.address || p.name || '';
-  if (key && stopCoordinates[key]) return stopCoordinates[key];
-  // DEMO spread-out fallback so stops are visually distinct on map
-  return DEMO_COORDS[fallbackIndex % DEMO_COORDS.length];
+function fitRegion(coords) {
+  if (!coords || !coords.length)
+    return { latitude: 33.6844, longitude: 73.0479, latitudeDelta: 0.06, longitudeDelta: 0.06 };
+  const lats = coords.map(c => c.latitude);
+  const lngs = coords.map(c => c.longitude);
+  const pad  = 0.025;
+  return {
+    latitude:       (Math.min(...lats) + Math.max(...lats)) / 2,
+    longitude:      (Math.min(...lngs) + Math.max(...lngs)) / 2,
+    latitudeDelta:  Math.max(Math.max(...lats) - Math.min(...lats) + pad * 2, 0.04),
+    longitudeDelta: Math.max(Math.max(...lngs) - Math.min(...lngs) + pad * 2, 0.04),
+  };
 }
 
-function parseTimeToday(timeStr) {
-  if (!timeStr) return null;
-  try {
-    const match = timeStr.match(/(\d{1,2}):(\d{2})\s*(AM|PM)?/i);
-    if (!match) return null;
-    let h    = parseInt(match[1], 10);
-    const m  = parseInt(match[2], 10);
-    const ap = (match[3] || "").toUpperCase();
-    if (ap === "PM" && h < 12) h += 12;
-    if (ap === "AM" && h === 12) h = 0;
-    const now = new Date();
-    return new Date(now.getFullYear(), now.getMonth(), now.getDate(), h, m, 0);
-  } catch { return null; }
+const getInitials = (name = "") => name.split(" ").map(n => n[0]).join("").substring(0, 2).toUpperCase();
+
+// ── Smooth animated van marker ────────────────────────────────────────────────
+function useSmoothVanPos(vanPos) {
+  const latAnim = useRef(new Animated.Value(vanPos?.latitude  || 33.6844)).current;
+  const lngAnim = useRef(new Animated.Value(vanPos?.longitude || 73.0479)).current;
+  const prevPos = useRef(vanPos);
+
+  useEffect(() => {
+    if (!vanPos?.latitude || !vanPos?.longitude) return;
+    if (
+      vanPos.latitude  === prevPos.current?.latitude &&
+      vanPos.longitude === prevPos.current?.longitude
+    ) return;
+    prevPos.current = vanPos;
+    Animated.parallel([
+      Animated.timing(latAnim, { toValue: vanPos.latitude,  duration: 900, useNativeDriver: false }),
+      Animated.timing(lngAnim, { toValue: vanPos.longitude, duration: 900, useNativeDriver: false }),
+    ]).start();
+  }, [vanPos?.latitude, vanPos?.longitude]);
+
+  return { latAnim, lngAnim };
 }
 
-function formatCountdown(ms) {
-  if (ms <= 0) return "now";
-  const totalSec = Math.ceil(ms / 1000);
-  const h = Math.floor(totalSec / 3600);
-  const m = Math.floor((totalSec % 3600) / 60);
-  const s = totalSec % 60;
-  if (h > 0) return `${h}h ${m}m`;
-  if (m > 0) return `${m}m ${s}s`;
-  return `${s}s`;
-}
-
-function sortByProximity(passengers, fromLat, fromLng) {
-  if (!passengers || passengers.length === 0) return passengers;
-  const remaining = [...passengers];
-  const sorted = [];
-  let curLat = fromLat;
-  let curLng = fromLng;
-  while (remaining.length > 0) {
-    let nearestIdx  = 0;
-    let nearestDist = Infinity;
-    remaining.forEach((p, idx) => {
-      const d = haversineKm(curLat, curLng, p.coordinate.latitude, p.coordinate.longitude);
-      if (d < nearestDist) { nearestDist = d; nearestIdx = idx; }
-    });
-    const nearest = remaining.splice(nearestIdx, 1)[0];
-    sorted.push(nearest);
-    curLat = nearest.coordinate.latitude;
-    curLng = nearest.coordinate.longitude;
-  }
-  return sorted;
-}
-
-// ─── Theme ────────────────────────────────────────────────────────────────────
-const P = {
-  main:      "#415844",
-  dark:      "#2D3E2F",
-  white:     "#FFFFFF",
-  bg:        "#F5F7F5",
-  light:     "#EDF1ED",
-  border:    "#C5D0C5",
-  textDark:  "#1A2218",
-  textMid:   "#374151",
-  textLight: "#6B7280",
-  error:     "#C62828",
+// ── Stop pin color helper ─────────────────────────────────────────────────────
+const stopBg = (status) => {
+  if (status === "picked")  return C.main;
+  if (status === "missed")  return "#EF4444";
+  if (status === "waiting") return C.amber;
+  return "#64748B";
 };
 
-const MENU = [
-  { view: "Dashboard",    label: "Dashboard",    icon: "grid-outline",        activeIcon: "grid"          },
-  { view: "Availability", label: "Availability", icon: "calendar-outline",    activeIcon: "calendar"      },
-  { view: "Routes",       label: "Routes",       icon: "map-outline",         activeIcon: "map"           },
-  { view: "History",      label: "Trip History", icon: "time-outline",        activeIcon: "time"          },
-  { view: "Payments",     label: "Payments",     icon: "card-outline",        activeIcon: "card"          },
-  { view: "Support",      label: "Complaints",   icon: "warning-outline",     activeIcon: "warning"       },
-  { view: "Messages",     label: "Messages",     icon: "chatbubbles-outline", activeIcon: "chatbubbles"   },
-  { view: "MonthlyFeedback", label: "Monthly Feedback", icon: "star-outline", activeIcon: "star"       },
-];
-
-const SECTION_TITLES = {
-  Dashboard:            "Dashboard",
-  Availability:         "Availability",
-  Routes:               "Routes",
-  History:              "Trip History",
-  Payments:             "Payments",
-  Support:              "Complaints",
-  Notifications:        "Notifications",
-  Profile:              "My Profile",
-  Messages:             "Messages",
-  LeaveNetwork:         "Leave Transporter Network",
-  DeleteAccount:        "Delete Account Permanently",
-};
-
-const initials = (name = "D") =>
-  (name || "D").split(" ").map(w => w[0]).slice(0, 2).join("").toUpperCase();
-
-async function registerFCMToken(authToken) {
-  try {
-    const authStatus = await requestPermission(getMessaging());
-    const granted =
-      authStatus === AuthorizationStatus.AUTHORIZED ||
-      authStatus === AuthorizationStatus.PROVISIONAL;
-    if (!granted) return;
-    const fcmToken = await getToken(getMessaging());
-    if (!fcmToken) return;
-    await fetch(`${API_BASE_URL}/push-token`, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${authToken}` },
-      body: JSON.stringify({ fcmToken }),
-    });
-  } catch (err) {
-    console.warn("[Driver] registerFCMToken:", err.message);
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-export default function UnifiedDriverDashboard({ navigation }) {
-
-  // ── Core refs ──────────────────────────────────────────────────────────────
-  const driverIdRef = useRef(null);
-  const authTokenRef = useRef(null);
-
-  // Socket refs
-  const socketRef = useRef(null);
-  const lastSocketEmit = useRef(0);
+export default function PassengerDashboard({ navigation }) {
+  const userTokenRef    = useRef(null);
+  const userIdRef       = useRef(null);
+  const intervalRef     = useRef(null);
+  const socketRef       = useRef(null);
   const activeTripIdRef = useRef(null);
+  const mapRef          = useRef(null);
 
-  // Simulation refs
-  const simSegmentRef   = useRef(0);
-  const simProgressRef  = useRef(0);
-  // isRestoringRef: true when sim is resuming from AsyncStorage (login after logout)
-  // prevents startSimulation from resetting segment/progress to 0
-  const isRestoringRef    = useRef(false);
-  const simTickRef        = useRef(0);   // tick counter for throttled AsyncStorage saves
-  // completeRouteRef: always points to the LATEST completeRoute function.
-  // The setInterval callback captures a stale closure — this ref is the fix.
-  const completeRouteRef  = useRef(null);
-  // routeEndingRef: prevents calling completeRoute multiple times before user confirms
-  const routeEndingRef    = useRef(false);
-  const simIntervalRef = useRef(null);
-  const alertedStopsRef = useRef(new Set());
-  const simPausedRef = useRef(false);
-  const lastLocationSyncRef = useRef(0);
+  const [userProfile,      setUserProfile]      = useState(null);
+  const [pickupPoint,      setPickupPoint]       = useState("");
+  const [assignedRoute,    setAssignedRoute]     = useState(null);
+  const [routeDriver,      setRouteDriver]       = useState(null);
+  const [driverInfo,       setDriverInfo]        = useState({ name:"Driver", rating:4.8, vehicleNumber:"N/A", vehicleModel:"Van" });
+  const [myPassengerEntry, setMyPassengerEntry]  = useState(null);
+  const [myStopIndex,      setMyStopIndex]       = useState(-1);
+  const [isNextPickup,     setIsNextPickup]      = useState(false);
+  const [pickedBeforeMe,   setPickedBeforeMe]    = useState(0);
+  const [totalPassengers,  setTotalPassengers]   = useState(0);
+  const [allPassengers,    setAllPassengers]     = useState([]);
 
-  // ── routeStopsRef ─────────────────────────────────────────────────────────
-  // The setInterval callback closes over the initial routeStops value (stale
-  // closure). This ref is kept in sync via useEffect so every interval tick
-  // reads the LIVE stop array — including status changes (picked / missed) —
-  // without restarting the interval and resetting simSegmentRef to 0.
-  const routeStopsRef = useRef([]);
+  // Tracking state
+  const [vanPos,              setVanPos]              = useState(null);
+  const [etaToMe,             setEtaToMe]             = useState(null);
+  const [vanArrived,          setVanArrived]           = useState(false);
+  const [boarded,             setBoarded]              = useState(false);
+  const [markingBoard,        setMarkingBoard]         = useState(false);
+  const [useLiveTripLocation, setUseLiveTripLocation]  = useState(false);
 
-  // Passenger / driver confirmation refs (used only for socket bookkeeping)
-  const passengerConfirmedRef = useRef(null);
-  const driverConfirmedRef = useRef(null);
+  // ── Polyline from driver (reuse, no recalculation) ──────────────────────
+  const [encodedPolyline, setEncodedPolyline] = useState(null);
+  const polylineCoords = useMemo(() => decodePolyline(encodedPolyline), [encodedPolyline]);
 
-  // Chat
-  const chatPollRef = useRef(null);
+  // ── Ride state ────────────────────────────────────────────────────────────
+  const [rideState,     setRideState]     = useState("PICKING_UP");
+  const [finalDestName, setFinalDestName] = useState(null);
+  const [tripCompleted, setTripCompleted] = useState(false);
 
-  // ── UI state ───────────────────────────────────────────────────────────────
-  const [sidebarOpen, setSidebarOpen] = useState(false);
-  const [currentView, setCurrentView] = useState("Dashboard");
-  const [loading, setLoading] = useState(false);
-  const slideAnim = useRef(new Animated.Value(-300)).current;
-  const blinkAnim = useRef(new Animated.Value(0)).current;
+  // ── Boarding (dual-confirm flow) ──────────────────────────────────────────
+  const [boardingPending,    setBoardingPending]    = useState(false);
+  const [boardingStopId,     setBoardingStopId]     = useState(null);
+  const [confirmingBoarding, setConfirmingBoarding] = useState(false);
+  // In-app boarding modal (replaces Alert.alert for YES/NO boarding)
+  const [showBoardingModal,  setShowBoardingModal]  = useState(false);
+  const [boardingStopName,   setBoardingStopName]   = useState("");
+  // Passenger tapped YES — waiting for driver to confirm
+  const [passengerSaidYes,   setPassengerSaidYes]   = useState(false);
 
-  // ── Monthly Feedback ────────────────────────────────────────────────────────
-  const [feedbackWindow,    setFeedbackWindow]     = useState({ isOpen: false, month: '', alreadySubmitted: false });
-  const [feedbackAnswers,   setFeedbackAnswers]    = useState({});
-  const [feedbackSubject,   setFeedbackSubject]    = useState('');
-  const [feedbackSaving,    setFeedbackSaving]     = useState(false);
-  const [feedbackSubmitted, setFeedbackSubmitted]  = useState(false);
+  // ── "I'm Not Going" feature ───────────────────────────────────────────────
+  const [showNotGoingModal,  setShowNotGoingModal]  = useState(false);
+  const [notGoingLoading,    setNotGoingLoading]    = useState(false);
+  const [notGoingOffenses,   setNotGoingOffenses]   = useState(0);   // fetched from server
+  const [notGoingDone,       setNotGoingDone]       = useState(false); // confirmed this session
 
-  // ── Auth / profile ─────────────────────────────────────────────────────────
-  const [authToken, setAuthToken] = useState(null);
-  const [driverProfile, setDriverProfile] = useState(null);
-  const [available, setAvailable] = useState(false);
-  const [networkTransporter, setNetworkTransporter] = useState(null);
+  // ── Smart Arrival Alert modal (in-app, no push) ───────────────────────────
+  // Queue of { level, emoji, title, body } — dismiss one, next auto-shows
+  const [arrivalAlertQueue,  setArrivalAlertQueue]  = useState([]);
+  const shownAlertLevels = useRef(new Set()); // prevent duplicate modals per level
+  const arrivalAlertAnim = useRef(new Animated.Value(0)).current;
 
-  // ── Availability ───────────────────────────────────────────────────────────
-  const [dashboardStats, setDashboardStats] = useState({ completedTrips: 0, activeTrips: 0, pendingTrips: 0, monthlyEarnings: 0 });
-  const [startTime, setStartTime] = useState("07:00 AM");
-  const [endTime, setEndTime] = useState("06:00 PM");
-  const [availabilityHistory, setAvailabilityHistory] = useState([]);
-  const [activeAvailabilityRecord, setActiveAvailabilityRecord] = useState(null);
+  const simRef     = useRef(null);
+  const segRef     = useRef(0);
+  const stepRef    = useRef(0);
+  const alertedRef = useRef(false);
+  const stopsRef   = useRef([]);
 
-  // ── Route / stops ──────────────────────────────────────────────────────────
-  const [assignedRoutes, setAssignedRoutes] = useState([]);
-  const [currentRoute, setCurrentRoute] = useState(null);
-  const [routeStarted, setRouteStarted] = useState(false);
-  const [routeStops, setRouteStops] = useState([]);
-  const [completedStops, setCompletedStops] = useState([]);
-  const [currentStopIndex, setCurrentStopIndex] = useState(0);
-  const [waitingAtStop, setWaitingAtStop] = useState(null);
-  const [stopDistances, setStopDistances] = useState([]);
-  const [currentLocation, setCurrentLocation] = useState({ latitude: 33.6844, longitude: 73.0479 });
+  const [activePolls,      setActivePolls]      = useState([]);
+  const [showPollModal,    setShowPollModal]     = useState(false);
+  const [selectedPoll,     setSelectedPoll]      = useState(null);
+  const [loadingResponse,  setLoadingResponse]   = useState("");
+  const shownPollIds = useRef(new Set());
 
-  // passengerConfirmedForStop — drives "✅ Passenger confirmed!" hint in driver UI
-  const [passengerConfirmedForStop, setPassengerConfirmedForStop] = useState(null);
+  const [showMorningConf, setShowMorningConf] = useState(false);
+  const [morningTrip,     setMorningTrip]     = useState(null);
+  const [notifications,   setNotifications]   = useState([]);
+  const [unreadCount,     setUnreadCount]     = useState(0);
+  // callVisible REMOVED — no call feature
+  const [chatVisible,     setChatVisible]     = useState(false);
+  const [unreadChatCount, setUnreadChatCount] = useState(0);
+  const [chatMessages,    setChatMessages]    = useState([]);
+  const [inputText,       setInputText]       = useState("");
+  const [typedCount,      setTypedCount]      = useState(0);
+  const [chatSending,     setChatSending]     = useState(false);
+  const flatListRef = useRef(null);
+  const [refreshing, setRefreshing] = useState(false);
+  const [loading,    setLoading]    = useState(false);
 
-  // ── Other screens ──────────────────────────────────────────────────────────
-  const [trips, setTrips] = useState([]);
-  const [search, setSearch] = useState("");
-  const [filter, setFilter] = useState("All");
-  const [paymentData, setPaymentData] = useState([]);
-  const [supportTickets, setSupportTickets] = useState([]);
-  const [newTicketVisible, setNewTicketVisible] = useState(false);
-  const [ticketSubject, setTicketSubject] = useState("");
-  const [ticketDescription, setTicketDescription] = useState("");
-  const [notifications, setNotifications] = useState([]);
-  const [unreadCount, setUnreadCount] = useState(0);
-  const [unreadMsgCount, setUnreadMsgCount] = useState(0);
+  const fadeAnim         = useRef(new Animated.Value(0)).current;
+  const cardAnim         = useRef(new Animated.Value(0)).current;
+  const pulseAnim        = useRef(new Animated.Value(1)).current;
+  const blinkAnim        = useRef(new Animated.Value(0)).current;
+  const pollSlideAnim    = useRef(new Animated.Value(-200)).current;
+  const pollPulseAnim    = useRef(new Animated.Value(1)).current;
+  const morningSlideAnim = useRef(new Animated.Value(-200)).current;
+  const morningPulseAnim = useRef(new Animated.Value(1)).current;
+  const nextPickupPulse  = useRef(new Animated.Value(1)).current;
+  const vanPulse         = useRef(new Animated.Value(1)).current;
+  const boardingPulse    = useRef(new Animated.Value(1)).current;
 
-  // ── Chat ───────────────────────────────────────────────────────────────────
-  const [chatOtherUser, setChatOtherUser] = useState(null);
-  const [chatMessages, setChatMessages] = useState([]);
-  const [chatSending, setChatSending] = useState(false);
+  // Smooth van marker
+  const { latAnim, lngAnim } = useSmoothVanPos(vanPos);
 
-  // ── Animations ────────────────────────────────────────────────────────────
-  useEffect(() => {
-    Animated.spring(slideAnim, {
-      toValue: sidebarOpen ? 0 : -300,
-      useNativeDriver: true, tension: 80, friction: 12,
-    }).start();
-  }, [sidebarOpen]);
-
-  useEffect(() => {
-    Animated.loop(
-      Animated.sequence([
-        Animated.timing(blinkAnim, { toValue: 1, duration: 800, useNativeDriver: false }),
-        Animated.timing(blinkAnim, { toValue: 0, duration: 800, useNativeDriver: false }),
-      ])
-    ).start();
-  }, []);
-
-  // ── Init ──────────────────────────────────────────────────────────────────
   useEffect(() => {
     loadAuthData();
     initSocket();
     return () => {
-      // ── CRITICAL FIX: On unmount, only clear interval — do NOT call
-      // stopSimulation(). stopSimulation removes persisted state (waiting stop,
-      // route started flag) which breaks resume after navigation/logout.
-      // The simulation interval itself will be garbage collected when the
-      // component unmounts — React's GC handles this automatically.
-      if (simIntervalRef.current) clearInterval(simIntervalRef.current);
-      socketRef.current?.disconnect();
-      if (chatPollRef.current) clearInterval(chatPollRef.current);
+      if (intervalRef.current) clearInterval(intervalRef.current);
+      clearInterval(simRef.current);
+      if (socketRef.current) { socketRef.current.disconnect(); socketRef.current = null; }
     };
   }, []);
 
-  // ── Keep routeStopsRef in sync ─────────────────────────────────────────────
-  // Written here, read inside setInterval (which would otherwise see stale data).
   useEffect(() => {
-    routeStopsRef.current = routeStops;
-  }, [routeStops]);
+    if (!userTokenRef.current) return;
+    if (intervalRef.current) clearInterval(intervalRef.current);
+    const ms = assignedRoute?.status === "in_progress" ? 8000 : 20000;
+    intervalRef.current = setInterval(() => fetchAll(userTokenRef.current, userIdRef.current), ms);
+  }, [assignedRoute?.status]);
 
-  // ── Simulation lifecycle ───────────────────────────────────────────────────
-  // Depends ONLY on routeStarted — NOT on routeStops.
-  // If routeStops were in deps, every stop status change (picked/missed) would
-  // restart the interval and reset simSegmentRef to 0, causing the van to jump
-  // back to the first passenger every time someone boards.
   useEffect(() => {
-    if (routeStarted) {
-      startSimulation();
+    if (assignedRoute?.status === "in_progress" && allPassengers.length > 1 && !boarded && !useLiveTripLocation) {
+      startPassengerSim();
     } else {
-      // Only call full stopSimulation (which clears persisted state) when
-      // routeStarted explicitly becomes false (user ended route). Do NOT
-      // call it in the cleanup return — that fires before every re-render
-      // and would wipe state when screen refreshes.
-      stopSimulation();
+      clearInterval(simRef.current);
     }
-    return () => {
-      // Cleanup: only clear the interval, preserve persisted state.
-      // Full stopSimulation(true) is called explicitly in completeRoute.
-      if (simIntervalRef.current) clearInterval(simIntervalRef.current);
-    };
-  }, [routeStarted]); // eslint-disable-line react-hooks/exhaustive-deps
+    return () => clearInterval(simRef.current);
+  }, [assignedRoute?.status, allPassengers.length, boarded, useLiveTripLocation]);
 
-  // ── Recalculate stop distances ─────────────────────────────────────────────
+  // Van pulse when close / arrived / boarding pending
   useEffect(() => {
-    if (routeStops.length < 2) { setStopDistances([]); return; }
-    const dists = [];
-    for (let i = 0; i < routeStops.length - 1; i++) {
-      const a = routeStops[i].coordinate;
-      const b = routeStops[i + 1].coordinate;
-      dists.push(haversineKm(a.latitude, a.longitude, b.latitude, b.longitude));
+    if (vanArrived || boardingPending || (etaToMe !== null && etaToMe <= 10)) {
+      Animated.loop(Animated.sequence([
+        Animated.timing(vanPulse, { toValue:1.3, duration:600, useNativeDriver:true }),
+        Animated.timing(vanPulse, { toValue:1,   duration:600, useNativeDriver:true }),
+      ])).start();
+    } else {
+      vanPulse.setValue(1);
     }
-    setStopDistances(dists);
-  }, [routeStops]);
+  }, [vanArrived, etaToMe, boardingPending]);
 
-  // ── Sync location ──────────────────────────────────────────────────────────
+  // Boarding button pulse
   useEffect(() => {
-    if (!routeStarted || !currentRoute?._id || !currentLocation) return;
-    syncRouteLocation({
-      latitude: currentLocation.latitude,
-      longitude: currentLocation.longitude,
-      speed: ASSUMED_SPEED_KMH,
-      eta: "", currentStop: "",
+    if (!boardingPending) { boardingPulse.setValue(1); return; }
+    Animated.loop(Animated.sequence([
+      Animated.timing(boardingPulse, { toValue:1.04, duration:700, useNativeDriver:true }),
+      Animated.timing(boardingPulse, { toValue:1,    duration:700, useNativeDriver:true }),
+    ])).start();
+  }, [boardingPending]);
+
+  // Auto-follow van in live mode
+  useEffect(() => {
+    if (!vanPos || !useLiveTripLocation) return;
+    mapRef.current?.animateToRegion(
+      { ...vanPos, latitudeDelta:0.025, longitudeDelta:0.025 }, 600
+    );
+  }, [vanPos?.latitude, vanPos?.longitude, useLiveTripLocation]);
+
+  // Entrance animations
+  useEffect(() => {
+    Animated.timing(fadeAnim, { toValue:1, duration:800, useNativeDriver:true }).start();
+    Animated.spring(cardAnim, { toValue:1, tension:50, friction:7, useNativeDriver:true }).start();
+    Animated.loop(Animated.sequence([
+      Animated.timing(blinkAnim, { toValue:1, duration:800, useNativeDriver:false }),
+      Animated.timing(blinkAnim, { toValue:0, duration:800, useNativeDriver:false }),
+    ])).start();
+    Animated.loop(Animated.sequence([
+      Animated.timing(pulseAnim, { toValue:1.3, duration:1000, useNativeDriver:true }),
+      Animated.timing(pulseAnim, { toValue:1,   duration:1000, useNativeDriver:true }),
+    ])).start();
+    Animated.loop(Animated.sequence([
+      Animated.timing(nextPickupPulse, { toValue:1.03, duration:900, useNativeDriver:true }),
+      Animated.timing(nextPickupPulse, { toValue:1,    duration:900, useNativeDriver:true }),
+    ])).start();
+  }, []);
+
+  // ── Arrival alert slide-in animation ─────────────────────────────────────
+  useEffect(() => {
+    if (arrivalAlertQueue.length > 0) {
+      arrivalAlertAnim.setValue(0);
+      Animated.spring(arrivalAlertAnim, { toValue:1, tension:60, friction:9, useNativeDriver:true }).start();
+    }
+  }, [arrivalAlertQueue.length]);
+
+  // ── Helper: push a new alert level (de-duplicates by level) ──────────────
+  const pushArrivalAlert = (level, emoji, title, body) => {
+    const key = `level_${level}`;
+    if (shownAlertLevels.current.has(key)) return; // already shown this level
+    shownAlertLevels.current.add(key);
+    setArrivalAlertQueue(prev => {
+      const exists = prev.some(a => a.level === level);
+      if (exists) return prev;
+      return [...prev, { level, emoji, title, body }];
     });
-  }, [routeStarted, currentRoute?._id, currentLocation?.latitude, currentLocation?.longitude]);
+  };
 
-  // ── Socket ────────────────────────────────────────────────────────────────
-  const initSocket = useCallback(() => {
+  // ── Dismiss top alert from queue ──────────────────────────────────────────
+  const dismissTopArrivalAlert = () => {
+    Animated.timing(arrivalAlertAnim, { toValue:0, duration:220, useNativeDriver:true }).start(() => {
+      setArrivalAlertQueue(prev => prev.slice(1));
+    });
+  };
+
+  // Reset alert level tracking when boarding is done
+  useEffect(() => {
+    if (boarded) shownAlertLevels.current = new Set();
+  }, [boarded]);
+
+  // Restore boarding state from AsyncStorage on mount
+  useEffect(() => {
+    AsyncStorage.multiGet([PKEY_VAN_ARRIVED, PKEY_VAN_STOP_ID]).then(results => {
+      const arrived = results[0][1] === "true";
+      const stopId  = results[1][1] || null;
+      if (arrived && !boarded) {
+        setVanArrived(true);
+        setBoardingPending(true);
+        setBoardingStopId(stopId);
+      }
+    }).catch(() => {});
+  }, []);
+
+  // ── Socket.io ──────────────────────────────────────────────────────────────
+  const initSocket = () => {
     try {
-      const { io } = require("socket.io-client"); // eslint-disable-line global-require
+      const { io } = require("socket.io-client");
       if (socketRef.current?.connected) return;
 
       const socket = io(SOCKET_URL, {
         transports: ["websocket", "polling"],
         reconnection: true,
-        reconnectionAttempts: 5,
+        reconnectionAttempts: 10,
         timeout: 10000,
       });
 
       socket.on("connect", () => {
-        console.log("[Socket] Driver connected:", socket.id);
-        if (activeTripIdRef.current) socket.emit("joinTrip", { tripId: activeTripIdRef.current, userId: driverIdRef.current });
+        console.log("[Socket] Passenger connected:", socket.id);
+        // Re-join ALL rooms on reconnect
+        if (activeTripIdRef.current) {
+          socket.emit("joinRide",  { rideId: activeTripIdRef.current, userId: userIdRef.current, role: "passenger" });
+          socket.emit("joinTrip",  { tripId: activeTripIdRef.current, userId: userIdRef.current });
+        }
+        if (userIdRef.current) socket.emit("joinUser", { userId: userIdRef.current });
       });
 
-      // ── passengerStatusUpdate ──────────────────────────────────────────────
-      // Fires when backend records a stop status change (e.g. passenger tapped
-      // "I'm On Board" and the API returned success).
-      // FIX: We ONLY update the UI stop list here. We do NOT resume the
-      // simulation — that is the exclusive job of pickupPassenger() so the
-      // driver must always press "Confirm Pickup" before the van moves on.
-      socket.on("passengerStatusUpdate", (data) => {
-        const { passengerId, status } = data || {};
-        if (!passengerId || !status) return;
-
-        setRouteStops(prev => prev.map(s => {
-          const sid = s.passengerId?.toString() || s._id?.toString();
-          return sid === passengerId?.toString() ? { ...s, status } : s;
-        }));
-
-        console.log(`[Socket] passengerStatusUpdate: ${passengerId} → ${status}  (UI only — sim stays paused)`);
-        // ↑ NO simPausedRef = false  |  NO setWaitingAtStop(null)
-      });
-
-      // ── passengerBoarded ───────────────────────────────────────────────────
-      // Passenger pressed "I'm On Board".  We record it and show a hint on the
-      // driver UI ("✅ Passenger confirmed — tap Confirm Pickup").
-      // Simulation stays paused until the driver presses the button.
-      socket.on("passengerBoarded", (data) => {
-        const { passengerId } = data || {};
-        if (!passengerId) return;
-        const idStr = passengerId?.toString();
-        console.log(`[Socket] passengerBoarded: ${idStr} — driver confirmation still needed`);
-
-        passengerConfirmedRef.current = idStr;
-        setPassengerConfirmedForStop(idStr);
-        // ✅ PERSIST passenger confirmation — survives app minimize/restart
-        AsyncStorage.setItem(PERSIST_PASSENGER_CONF, idStr).catch(() => { });
-        // Simulation stays paused — pickupPassenger() is the single resume gate.
-      });
-
-      // ── passengerNotGoing — passenger said NO at boarding ──────────────────
-      // Auto-resume simulation: mark stop as missed and move to next stop.
-      // The passenger said they are not going today (penalty already applied).
-      socket.on("passengerNotGoing", (data) => {
-        const { passengerId, passengerName, penaltyAmount } = data || {};
-        if (!passengerId) return;
-        const idStr = passengerId?.toString();
-        console.log(`[Socket] passengerNotGoing: ${passengerName} (${idStr}) — auto-resuming simulation`);
-
-        // Mark this stop as missed in local route state
-        setRouteStops(prev => prev.map(s => {
-          const sid = s.passengerId?.toString() || s._id?.toString();
-          return sid === idStr ? { ...s, status: 'missed' } : s;
-        }));
-
-        // Auto-resume simulation — passenger is not boarding, van moves to next stop
-        if (simPausedRef.current) {
-          simPausedRef.current = false;
-          setWaitingAtStop(null);
-          setPassengerConfirmedForStop(null);
-          passengerConfirmedRef.current = null;
-          AsyncStorage.multiRemove([
-            PERSIST_WAITING_STOP, PERSIST_WAITING_ROUTE, PERSIST_PASSENGER_CONF,
-          ]).catch(() => {});
-          console.log('[Driver] Simulation resumed — passenger not going');
+      // ── POLYLINE from driver — reuse without recalculating ─────────────────
+      socket.on("routeUpdate", (data) => {
+        console.log('[Passenger] routeUpdate received, has polyline:', !!data?.encodedPolyline, 'rideId:', data?.rideId);
+        if (data?.encodedPolyline) {
+          setEncodedPolyline(data.encodedPolyline);
+          setUseLiveTripLocation(true);
+          clearInterval(simRef.current);
+        }
+        // Also handle straight-line fallback when Google API fails on driver side
+        if (!data?.encodedPolyline && data?.waypointCoords?.length > 1) {
+          console.log('[Passenger] routeUpdate: using straight-line fallback coords');
+          // waypointCoords are raw lat/lng — handled by passenger's own fallback renderer
         }
       });
 
-      socket.on("disconnect", reason => console.log("[Socket] Driver disconnected:", reason));
+      // ── Real-time van location from driver ─────────────────────────────────
+      socket.on("vanLocationUpdate", (data) => {
+        const lat = data?.latitude ?? data?.currentLocation?.latitude;
+        const lng = data?.longitude ?? data?.currentLocation?.longitude;
+        if (lat == null || lng == null) return;
+        const newPos = { latitude: Number(lat), longitude: Number(lng) };
+        setVanPos(newPos);
+        setUseLiveTripLocation(true);
+        clearInterval(simRef.current);
+
+        // Check 10-min threshold from live GPS
+        const myIdx = myStopIndex;
+        if (myIdx >= 0 && stopsRef.current.length > myIdx && !alertedRef.current) {
+          const myCoord = stopsRef.current[myIdx]?.coordinate;
+          if (myCoord) {
+            const dist = haversine(newPos.latitude, newPos.longitude, myCoord.latitude, myCoord.longitude);
+            const eta  = Math.max(1, Math.round((dist / SPEED_KMH) * 60));
+            setEtaToMe(eta);
+            if (eta <= 10) {
+              alertedRef.current = true;
+              Alert.alert(
+                "🚨 Van is 10 Minutes Away!",
+                `Van is ~${eta} minute${eta === 1 ? "" : "s"} away from your stop!\nGet ready at: ${stopsRef.current[myIdx]?.name || "your pickup"}`,
+                [{ text: "Got it! 👍" }]
+              );
+            }
+          }
+        }
+      });
+
+      // ── driverLocationUpdate — server re-broadcasts under this alias too ──────
+      // Server sends BOTH 'vanLocationUpdate' AND 'driverLocationUpdate' on every
+      // locationUpdate from driver. We listen to both for resilience.
+      socket.on("driverLocationUpdate", (data) => {
+        const lat = data?.latitude ?? data?.currentLocation?.latitude;
+        const lng = data?.longitude ?? data?.currentLocation?.longitude;
+        if (lat == null || lng == null) return;
+        console.log('[Passenger] driverLocationUpdate:', Number(lat).toFixed(5), Number(lng).toFixed(5));
+        const newPos = { latitude: Number(lat), longitude: Number(lng) };
+        setVanPos(newPos);
+        setUseLiveTripLocation(true);
+        clearInterval(simRef.current);
+      });
+
+      // ── tripLocationUpdate (same as vanLocationUpdate, accept both) ─────────
+      socket.on("tripLocationUpdate", (data) => {
+        const lat = data?.latitude ?? data?.currentLocation?.latitude;
+        const lng = data?.longitude ?? data?.currentLocation?.longitude;
+        if (lat == null || lng == null) return;
+        const newPos = { latitude: Number(lat), longitude: Number(lng) };
+        setVanPos(newPos);
+        setUseLiveTripLocation(true);
+        clearInterval(simRef.current);
+      });
+
+      // ── Ride state changes ─────────────────────────────────────────────────
+      socket.on("rideStateChange", (data) => {
+        if (!data) return;
+        if (data.state === "GOING_TO_DESTINATION") {
+          setRideState("GOING_TO_DESTINATION");
+          setFinalDestName(data.destinationName || "Destination");
+          if (data.encodedPolyline) setEncodedPolyline(data.encodedPolyline);
+        }
+        if (data.state === "COMPLETED") {
+          setRideState("COMPLETED");
+          setTripCompleted(true);
+        }
+      });
+
+      // ── tenMinAlert — driver simulation emits tiered ETA alerts ────────────
+      socket.on("tenMinAlert", (data) => {
+        const myId    = userIdRef.current;
+        const isForMe = data?.passengerId?.toString() === myId || data?.passengerId === myId;
+        if (!isForMe) return;
+
+        const eta      = data?.etaMin    || data?.alertLevel || 10;
+        const level    = data?.alertLevel || 10;
+        const stop     = data?.stopName  || stopsRef.current[myStopIndex]?.name || "your pickup point";
+        const levelKey = `alert_${level}`;
+        if (alertedRef.current === levelKey) return;
+        alertedRef.current = levelKey;
+        setEtaToMe(eta);
+
+        const cfg = {
+          10: { emoji:"⏱️", title:"Be Ready! Vehicle Approaching",  body:`Vehicle arriving in ~${eta} min at:\n${stop}\n\nStart making your way to the pickup point.` },
+          5:  { emoji:"🚐", title:"5 Minutes Away — Head Out Now!", body:`Vehicle is ~${eta} min away at:\n${stop}\n\nPlease go to your pickup point now!` },
+          3:  { emoji:"⚠️", title:"Almost There — 3 Minutes!",      body:`Vehicle arriving in ~${eta} min at:\n${stop}\n\nBe at your spot RIGHT NOW!` },
+          1:  { emoji:"🚨", title:"Vehicle is 1 Minute Away!",      body:`Vehicle is 1 min away at:\n${stop}\n\nYour driver is almost here — don't miss it!` },
+        }[level] || { emoji:"⏱️", title:"Van Alert", body:`Van ~${eta} min away at ${stop}` };
+
+        // Show in-app modal instead of native Alert
+        // Fix: pushArrivalAlert is the correct function (setArrivalAlert does not exist)
+        pushArrivalAlert(level, cfg.emoji, cfg.title, cfg.body);
+      });
+
+      // ── boardingRequest — van arrived at THIS passenger's stop ─────────────
+      socket.on("boardingRequest", (data) => {
+        const myId    = userIdRef.current;
+        const isForMe = data?.passengerId?.toString() === myId || data?.passengerId === myId;
+        if (!isForMe || boarded) return;
+
+        setVanArrived(true);
+        setBoardingPending(true);
+        setBoardingStopId(data?.stopId || null);
+        setBoardingStopName(data?.stopName || "your stop");
+        clearInterval(simRef.current);
+
+        // Persist so button reappears after app restart
+        AsyncStorage.multiSet([
+          [PKEY_VAN_ARRIVED,  "true"],
+          [PKEY_VAN_STOP_ID,  data?.stopId?.toString()  || ""],
+          [PKEY_VAN_ROUTE_ID, data?.routeId?.toString() || ""],
+        ]).catch(() => {});
+
+        // Show in-app modal instead of native Alert
+        setShowBoardingModal(true);
+      });
+
+      // ── bothConfirmed — driver + passenger both confirmed → boarded ────────
+      socket.on("bothConfirmed", (data) => {
+        const myId = userIdRef.current;
+        if (data?.passengerId?.toString() === myId || data?.passengerId === myId) {
+          setBoarded(true);
+          setVanArrived(false);
+          setBoardingPending(false);
+          setPassengerSaidYes(false);
+          setBoardingStopId(null);
+          clearInterval(simRef.current);
+          AsyncStorage.multiRemove([PKEY_VAN_ARRIVED, PKEY_VAN_STOP_ID, PKEY_VAN_ROUTE_ID]).catch(() => {});
+        }
+      });
+
+      // ── passengerBoarded / passengerStatusUpdate — legacy + driver-side ────
+      socket.on("passengerBoarded", (data) => {
+        const myId = userIdRef.current;
+        if (data?.passengerId?.toString() === myId) {
+          setBoarded(true); setVanArrived(false); setBoardingPending(false);
+        }
+      });
+      socket.on("passengerStatusUpdate", (data) => {
+        const myId = userIdRef.current;
+        if (data?.passengerId?.toString() === myId || data?.passengerId === myId) {
+          if (data.status === "picked") {
+            setBoarded(true);
+            setVanArrived(false);
+            setBoardingPending(false);
+            clearInterval(simRef.current);
+          }
+        }
+      });
+
+      socket.on("rideCompleted", () => {
+        setTripCompleted(true); setRideState("COMPLETED");
+        setUseLiveTripLocation(false); clearInterval(simRef.current);
+        setChatVisible(false); setUnreadChatCount(0);
+      });
+
+      socket.on("routeCompleted", () => {
+        setUseLiveTripLocation(false);
+        clearInterval(simRef.current);
+        setChatVisible(false);
+        setUnreadChatCount(0);
+      });
+
+      // ── rideChat — real-time message from driver ───────────────────────────
+      socket.on("rideChat", (data) => {
+        const myId = userIdRef.current;
+        if (!data?.senderId || data.senderId?.toString() === myId?.toString()) return;
+        if (data?.senderRole !== "driver") return;
+        if (!chatVisible) setUnreadChatCount(prev => prev + 1);
+      });
+
+      socket.on("chatEnded", () => {
+        setChatVisible(false);
+        setUnreadChatCount(0);
+      });
+
+      socket.on("statsRefresh", () => {
+        console.log("[Socket] statsRefresh received — pulling fresh data");
+        fetchAll(userTokenRef.current, userIdRef.current);
+      });
+
+      // ── routeStarted — driver pressed Start Route ──────────────────────────
+      socket.on("routeStarted", (data) => {
+        console.log("[Passenger] routeStarted received — rideId:", data?.rideId, "polyline:", !!data?.encodedPolyline);
+        // Immediately refresh so driver card + map appear
+        fetchAll(userTokenRef.current, userIdRef.current);
+        // Load polyline immediately if driver already generated it
+        if (data?.encodedPolyline) {
+          setEncodedPolyline(data.encodedPolyline);
+          setUseLiveTripLocation(true);
+        }
+        // Persist drop-off location from server payload
+        if (data?.dropOffLocation) {
+          setAssignedRoute(prev => prev ? {
+            ...prev,
+            dropOffLocation: data.dropOffLocation,
+            destinationLat:  data.dropOffLocation.latitude  || prev.destinationLat,
+            destinationLng:  data.dropOffLocation.longitude || prev.destinationLng,
+            destination:     data.dropOffLocation.name      || prev.destination,
+          } : prev);
+        }
+        // Update passenger coords from payload (server now sends full coords)
+        if (Array.isArray(data?.passengers) && data.passengers.length > 0) {
+          setAllPassengers(prev => {
+            if (!prev?.length) return data.passengers;
+            return prev.map(existing => {
+              const updated = data.passengers.find(p =>
+                p.passengerId?.toString() ===
+                  (existing.passengerId?.toString() || existing._id?.toString())
+              );
+              return updated ? { ...existing, ...updated } : existing;
+            });
+          });
+        }
+        // Join the ride room immediately
+        if (data?.rideId && socketRef.current?.connected) {
+          socketRef.current.emit("joinRide",  { rideId: data.rideId, userId: userIdRef.current, role: "passenger" });
+          socketRef.current.emit("joinTrip",  { tripId: data.rideId, userId: userIdRef.current });
+          activeTripIdRef.current = data.rideId;
+        }
+      });
+
+      // ── rideUpdated — generic state sync (includes polyline updates) ──────
+      socket.on("rideUpdated", (data) => {
+        // If a polyline is bundled in, apply it immediately without waiting for fetchAll
+        if (data?.encodedPolyline) {
+          setEncodedPolyline(data.encodedPolyline);
+          setUseLiveTripLocation(true);
+        }
+        if (data?.dropOffLocation) {
+          setAssignedRoute(prev => prev ? {
+            ...prev,
+            dropOffLocation: data.dropOffLocation,
+            destinationLat:  data.dropOffLocation.latitude  || prev.destinationLat,
+            destinationLng:  data.dropOffLocation.longitude || prev.destinationLng,
+            destination:     data.dropOffLocation.name      || prev.destination,
+          } : prev);
+        }
+        fetchAll(userTokenRef.current, userIdRef.current);
+      });
+
+      socket.on("disconnect", (reason) => {
+        console.log("[Socket] Passenger disconnected:", reason);
+        setUseLiveTripLocation(false);
+      });
+
       socketRef.current = socket;
     } catch (e) {
-      console.log("[Socket] not available:", e.message);
+      console.log("[Socket] socket.io-client not available:", e.message);
     }
-  }, []);
+  };
 
-  // ── FCM ───────────────────────────────────────────────────────────────────
+  // Re-join socket rooms when active trip changes
   useEffect(() => {
-    const unsubFg = onMessage(getMessaging(), async (remoteMessage) => {
-      const title = remoteMessage.notification?.title;
-      const body = remoteMessage.notification?.body;
-      const data = remoteMessage.data || {};
+    if (!activeTripIdRef.current || !socketRef.current?.connected) return;
+    socketRef.current.emit("joinRide",  { rideId: activeTripIdRef.current, userId: userIdRef.current, role: "passenger" });
+    socketRef.current.emit("joinTrip",  { tripId: activeTripIdRef.current, userId: userIdRef.current });
+    if (userIdRef.current) socketRef.current.emit("joinUser", { userId: userIdRef.current });
+    console.log("[Socket] Passenger joined trip room:", activeTripIdRef.current);
+  }, [activeTripIdRef.current]); // eslint-disable-line
 
-      if (data.type === "auto_assign") {
-        fetchAssignedRoutes(driverIdRef.current, authTokenRef.current);
-        Alert.alert(title || "Route Assigned", body || "A new route has been assigned to you.");
-      } else if (data.type === "midnight_summary") {
-        fetchAssignedRoutes(driverIdRef.current, authTokenRef.current);
-        if (title) Alert.alert(title, body || "");
-      } else if (data.type === "alarm" || data.type === "availability_reminder") {
-        if (title) Alert.alert(title, body || "");
-      } else if (data.type === "message") {
-        if (currentView === "Messages" && chatOtherUser?._id) {
-          fetchChatMessages(chatOtherUser._id);
-        } else {
-          setUnreadMsgCount(prev => prev + 1);
+  // ── PASSENGER confirms boarding → emits socket event to driver ─────────────
+  const handlePassengerConfirmBoarding = async () => {
+    if (confirmingBoarding || boarded) return;
+    setConfirmingBoarding(true);
+    try {
+      const myId   = userIdRef.current;
+      const rideId = activeTripIdRef.current;
+      const tok    = userTokenRef.current;
+
+      // HTTP confirmation (persist to DB)
+      if (rideId && tok) {
+        await fetch(`${API_BASE_URL}/trips/${rideId}/passenger-confirm`, {
+          method:  "POST",
+          headers: { "Content-Type": "application/json", Authorization: `Bearer ${tok}` },
+          body:    JSON.stringify({ stopIndex: myStopIndex, passengerId: myId }),
+        }).catch(() => {});
+      }
+
+      // Socket event — driver receives this immediately and resumes simulation
+      if (socketRef.current?.connected && rideId) {
+        socketRef.current.emit("passengerConfirmBoarding", {
+          rideId, tripId: rideId,
+          stopId:      boardingStopId || myId,
+          passengerId: myId,
+        });
+      }
+
+      setBoardingPending(false);
+      setPassengerSaidYes(true);  // Show "Pending Confirmation" until driver confirms
+      setShowBoardingModal(false);
+      // Wait for "bothConfirmed" from server before setting boarded=true
+    } catch (e) {
+      Alert.alert("Error", "Could not confirm boarding. Please try again.");
+    } finally {
+      setConfirmingBoarding(false);
+    }
+  };
+
+  // ── "I'm Not Going" handler ───────────────────────────────────────────────
+  const handleNotGoing = async () => {
+    if (notGoingLoading || notGoingDone) return;
+    setNotGoingLoading(true);
+    try {
+      const tok     = userTokenRef.current;
+      const routeId = assignedRoute?._id;
+      const myId    = userIdRef.current;
+      if (!tok || !routeId || !myId) throw new Error('Missing auth info');
+
+      const res  = await fetch(
+        `${API_BASE_URL}/routes/${routeId}/stops/${myId}/not-going`,
+        { method: 'PUT', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${tok}` } }
+      );
+      const data = await res.json();
+      if (!data.success) throw new Error(data.message || 'Failed');
+
+      setNotGoingOffenses(data.offenseCount || 0);
+      setNotGoingDone(true);
+      setShowNotGoingModal(false);
+      setBoardingPending(false);
+      setVanArrived(false);
+
+      // Socket — tell driver this passenger is not going
+      if (socketRef.current?.connected) {
+        const rideId = activeTripIdRef.current;
+        socketRef.current.emit('passengerNotGoing', {
+          rideId, routeId,
+          passengerId:  myId,
+          penaltyAmount: data.penaltyAmount,
+          offenseCount:  data.offenseCount,
+        });
+      }
+
+      Alert.alert(
+        '✅ Noted',
+        data.penaltyAmount > 0
+          ? `You have been marked as Not Going.\nA penalty of Rs. ${data.penaltyAmount} has been added to your account (Offense #${data.offenseCount}).`
+          : 'You have been marked as Not Going. The driver has been notified.',
+        [{ text: 'OK' }]
+      );
+    } catch (e) {
+      Alert.alert('Error', e.message || 'Could not process. Please try again.');
+    } finally {
+      setNotGoingLoading(false);
+    }
+  };
+
+  // ── Local simulation fallback (when no live GPS) ───────────────────────────
+  const startPassengerSim = () => {
+    clearInterval(simRef.current);
+    const stops = buildStops();
+    if (stops.length < 2) return;
+    stopsRef.current   = stops;
+    segRef.current     = 0;
+    stepRef.current    = 0;
+    alertedRef.current = false;
+    setVanPos(stops[0].coordinate);
+
+    simRef.current = setInterval(() => {
+      const ss = stopsRef.current;
+      if (!ss || ss.length < 2) { clearInterval(simRef.current); return; }
+
+      let seg      = segRef.current;
+      let progress = stepRef.current;
+      const totalSegs = ss.length - 1;
+      if (seg >= totalSegs) { clearInterval(simRef.current); return; }
+
+      const segDistKm    = haversine(
+        ss[seg].coordinate.latitude,     ss[seg].coordinate.longitude,
+        ss[seg + 1].coordinate.latitude, ss[seg + 1].coordinate.longitude
+      );
+      const kmPerTick    = (SPEED_KMH * FRAME_MS) / 3600000;
+      const stepFraction = segDistKm > 0 ? kmPerTick / segDistKm : 0.015;
+
+      progress += stepFraction;
+
+      if (progress >= 1) {
+        progress = 0;
+        seg      += 1;
+        if (seg >= totalSegs) {
+          clearInterval(simRef.current);
+          segRef.current  = seg;
+          stepRef.current = progress;
+          return;
         }
-        if (title) Alert.alert(title, body || "");
-      } else if (title) {
-        Alert.alert(title, body || "");
+        if (seg === myStopIndex && !boarded) {
+          setVanArrived(true);
+          clearInterval(simRef.current);
+          segRef.current  = seg;
+          stepRef.current = progress;
+          return;
+        }
       }
-      fetchNotifications(driverIdRef.current, authTokenRef.current);
-    });
 
-    const unsubOpened = onNotificationOpenedApp(getMessaging(), (remoteMessage) => {
-      const data = remoteMessage?.data || {};
-      if (data.screen === "Routes") {
-        setCurrentView("Routes");
-        fetchAssignedRoutes(driverIdRef.current, authTokenRef.current);
-      } else if (data.screen === "Availability") {
-        setCurrentView("Availability");
-      } else if (data.screen === "Messages") {
-        openChatWithTransporter();
+      const pos = lerp(ss[seg].coordinate, ss[seg + 1].coordinate, progress);
+      setVanPos(pos);
+
+      // ETA to MY stop
+      const myIdx = myStopIndex;
+      if (myIdx >= 0 && myIdx < ss.length && seg < myIdx) {
+        const myCoord = ss[myIdx].coordinate;
+        const dist    = haversine(pos.latitude, pos.longitude, myCoord.latitude, myCoord.longitude);
+        const eta     = Math.max(1, Math.round((dist / SPEED_KMH) * 60));
+        setEtaToMe(eta);
+
+        if (eta <= 10 && !alertedRef.current) {
+          alertedRef.current = true;
+          Alert.alert(
+            "🚨 Van is 10 Minutes Away!",
+            `Van will reach your stop in ~${eta} minute${eta === 1 ? "" : "s"}!\nGet ready at: ${ss[myIdx].name}`,
+            [{ text: "Got it! I'm Ready! 👍" }]
+          );
+        }
       }
+
+      segRef.current  = seg;
+      stepRef.current = progress;
+    }, FRAME_MS);
+  };
+
+  const buildStops = () => {
+    return (allPassengers || []).map((p, i) => {
+      const coord = resolvePassengerCoord(p, i);
+      return {
+        _id:           p._id?.toString() || `p-${i}`,
+        name:          p.pickupPoint || p.pickupAddress || `Stop ${i + 1}`,
+        passengerName: p.passengerName || "Passenger",
+        coordinate:    coord,
+      };
     });
+  };
 
-    getInitialNotification(getMessaging()).then((remoteMessage) => {
-      if (!remoteMessage) return;
-      const data = remoteMessage?.data || {};
-      if (data.screen === "Routes") setCurrentView("Routes");
-      else if (data.screen === "Messages") openChatWithTransporter();
-    });
-
-    setBackgroundMessageHandler(getMessaging(), async (remoteMessage) => {
-      console.log("[Driver] FCM background:", remoteMessage.notification?.title);
-    });
-
-    return () => { unsubFg(); unsubOpened(); };
-  }, [currentView, chatOtherUser]);
-
-  // ── Helpers ───────────────────────────────────────────────────────────────
-  const getHeaders = useCallback((tok = null) => ({
-    "Content-Type": "application/json",
-    Authorization: `Bearer ${tok || authTokenRef.current || authToken}`,
-  }), [authToken]);
-
-  // ── Auth ──────────────────────────────────────────────────────────────────
+  // ── Auth & data ────────────────────────────────────────────────────────────
   const loadAuthData = async () => {
     try {
-      const token = await AsyncStorage.getItem("authToken");
-      const userId = await AsyncStorage.getItem("userId") || await AsyncStorage.getItem("driverId");
-      const uStr = await AsyncStorage.getItem("userData");
-      if (!token || !userId) {
-        navigation.reset({ index: 0, routes: [{ name: "Login" }] });
-        return;
+      const token    = await AsyncStorage.getItem("authToken");
+      const storedId = await AsyncStorage.getItem("userId");
+      const udStr    = await AsyncStorage.getItem("userData");
+      if (!token || !storedId) { navigation.reset({ index:0, routes:[{ name:"Login" }] }); return; }
+      userTokenRef.current = token;
+      userIdRef.current    = storedId;
+      if (udStr) {
+        const ud = JSON.parse(udStr);
+        setUserProfile(ud);
+        setPickupPoint(ud.pickupPoint || ud.address || "");
       }
-      driverIdRef.current = userId;
-      authTokenRef.current = token;
-      setAuthToken(token);
-      if (uStr) try { setDriverProfile(JSON.parse(uStr)); } catch { }
-      await registerFCMToken(token);
-      await loadAllData(userId, token);
-
-      // ✅ RESTORE persistent pickup confirmation state
-      // This keeps the "Confirm Passenger Onboarded" button visible even after
-      // app minimize, logout/login, or screen refresh.
-      try {
-        const [
-          [, savedWaitingStop],
-          [, savedRouteId],
-          [, savedPassengerConf],
-          [, savedRouteStarted],
-          [, savedTripId],
-        ] = await AsyncStorage.multiGet([
-          PERSIST_WAITING_STOP,
-          PERSIST_WAITING_ROUTE,
-          PERSIST_PASSENGER_CONF,
-          PERSIST_ROUTE_STARTED,
-          PERSIST_ACTIVE_TRIP,
-        ]);
-
-        // Only restore if the saved routeId matches the currently assigned route
-        // (prevents stale state from a previous route showing up)
-        if (savedWaitingStop && savedRouteId) {
-          // We'll match after fetchAssignedRoutes has run — use a short delay
-          // so setCurrentRoute() has settled in React state
-          setTimeout(async () => {
-            const currentRouteId = (await AsyncStorage.getItem(PERSIST_WAITING_ROUTE)) || "";
-            if (currentRouteId) {
-              console.log("[Driver] 🔄 Restoring pickup pause from storage:", savedWaitingStop);
-              setWaitingAtStop(savedWaitingStop);
-              simPausedRef.current = true;
-              if (savedPassengerConf) {
-                setPassengerConfirmedForStop(savedPassengerConf);
-                passengerConfirmedRef.current = savedPassengerConf;
-              }
-            }
-          }, 1500);
-        }
-
-        if (savedRouteStarted === "true" && savedTripId) {
-          activeTripIdRef.current = savedTripId;
-          if (socketRef.current?.connected) {
-            socketRef.current.emit("joinTrip", { tripId: savedTripId, userId: driverIdRef.current });
-          }
-        }
-      } catch (e) { console.warn("[Driver] restore state error:", e); }
-
-      try {
-        const hdrs = { "Content-Type": "application/json", Authorization: `Bearer ${token}` };
-        const pr = await fetch(`${API_BASE_URL}/profile`, { headers: hdrs });
-        const pd = await pr.json();
-
-        // ── Extract driver home lat/lng from fresh profile ────────────────
-        // This ensures the simulation origin uses the driver's REAL saved
-        // location from the database, not just whatever is in AsyncStorage.
-        // User model stores latitude/longitude fields directly on the user doc.
-        const freshLat = pd.latitude  ?? pd.location?.coordinates?.[1] ?? null;
-        const freshLng = pd.longitude ?? pd.location?.coordinates?.[0] ?? null;
-        if (freshLat != null && freshLng != null) {
-          setDriverProfile(prev => ({
-            ...(prev || {}),
-            ...(pd.name     ? { name:     pd.name     } : {}),
-            ...(pd.phone    ? { phone:    pd.phone    } : {}),
-            ...(pd.vehicle  ? { vehicle:  pd.vehicle  } : {}),
-            ...(pd.vehicleNo? { vehicleNo:pd.vehicleNo} : {}),
-            latitude:  freshLat,
-            longitude: freshLng,
-          }));
-          console.log(`[Driver] 📍 Home coords loaded: ${freshLat.toFixed(5)}, ${freshLng.toFixed(5)}`);
-        }
-
-        const tid = pd.transporterId || pd.transporter?._id || pd.transporter;
-        if (tid) {
-          const tr = await fetch(`${API_BASE_URL}/profile/${tid}`, { headers: hdrs });
-          const td = await tr.json();
-          if (td._id || td.id) {
-            setNetworkTransporter({ _id: td._id || td.id, name: td.name || "Transporter" });
-          }
-        }
-      } catch (e) { console.warn("fetchTransporter:", e); }
-
-      const poll = setInterval(() => {
-        fetchAssignedRoutes(driverIdRef.current, authTokenRef.current);
-        fetchNotifications(driverIdRef.current, authTokenRef.current);
-      }, 30000);
-      return () => clearInterval(poll);
+      await fetchAll(token, storedId);
     } catch (e) { console.error("loadAuthData:", e); }
   };
 
-  const loadAllData = async (uid, tok) => {
-    setLoading(true);
-    try {
-      await Promise.all([
-        fetchDashboardStats(uid, tok),
-        fetchAssignedRoutes(uid, tok),
-        fetchAvailabilityHistory(uid, tok),
-        fetchPayments(uid, tok),
-        fetchTrips(uid, tok),
-        fetchSupportTickets(uid, tok),
-        fetchNotifications(uid, tok),
-        fetchFeedbackWindow(tok),
-      ]);
-    } finally { setLoading(false); }
+  const getHeaders = (tok) => ({
+    "Content-Type": "application/json",
+    Authorization: `Bearer ${tok || userTokenRef.current}`,
+  });
+
+  const fetchAll = async (tok, uid) => {
+    await Promise.allSettled([
+      fetchAssignedRoute(tok, uid),
+      fetchActivePolls(tok, uid),
+      fetchNotifications(tok, uid),
+      fetchCurrentTrip(tok, uid),
+    ]);
   };
 
-  // ── Fetchers ──────────────────────────────────────────────────────────────
-  const fetchDashboardStats = async (uid, tok) => {
+  const fetchAssignedRoute = async (tok, uid) => {
+    const t = tok || userTokenRef.current, id = uid || userIdRef.current;
+    if (!t || !id) return;
     try {
-      // Use driver ride-history endpoint (filters by driverId, not transporterId).
-      // The generic /dashboard/stats uses transporterId which equals the company ID,
-      // NOT the driver's ID — so it always returns 0 for drivers.
-      const r = await fetch(`${API_BASE_URL}/trips/driver/ride-history`, { headers: getHeaders(tok) });
-      const d = await r.json();
-      if (d.success) {
-        const rides = d.rides || d.data || [];
-        setDashboardStats({
-          completedTrips: rides.filter(t =>
-            ['Completed', 'completed'].includes(t.status)
-          ).length,
-          activeTrips: rides.filter(t =>
-            ['Active', 'En Route', 'ongoing', 'active'].includes(t.status)
-          ).length,
-          pendingTrips: rides.filter(t =>
-            ['Missed', 'missed', 'Cancelled', 'cancelled'].includes(t.status)
-          ).length,
-          monthlyEarnings: 0,
-        });
-      }
-    } catch { }
-  };
+      const res    = await fetch(`${API_BASE_URL}/routes?passengerId=${id}`, { headers: getHeaders(t) });
+      const data   = await res.json();
+      const routes = data.routes || data.data || [];
+      const route  = routes.find(r => ["assigned","in_progress","active"].includes(r.status));
+      if (route) {
+        setAssignedRoute(route);
 
-  const fetchAssignedRoutes = useCallback(async (uid, tok) => {
-    try {
-      const id = uid || driverIdRef.current;
-      const tkn = tok || authTokenRef.current;
-      const r = await fetch(`${API_BASE_URL}/routes?assignedDriver=${id}`, { headers: getHeaders(tkn) });
-      const d = await r.json();
-      const arr = d.routes || d.data || [];
-      setAssignedRoutes(arr);
-
-      if (arr.length > 0) {
-        // ── CRITICAL FIX: Pick the in_progress route first ──────────────────
-        // Routes are sorted newest-first. If driver has an in_progress route
-        // plus tomorrow's assigned route, arr[0] would be the WRONG one.
-        // Always prefer in_progress, then fallback to first in list.
-        const first = arr.find(r => r.status === 'in_progress') || arr[0];
-        setCurrentRoute(first);
-
-        const rawStops = (first.passengers || []).map((p, i) => {
-          // resolveCoord: tries DB lat/lng → named stop lookup → DEMO fallback
-          const coord = resolveCoord(p, i);
-          return {
-            _id: p._id?.toString() || `stop-${i}`,
-            passengerId: p.passengerId?.toString() || p._id?.toString(),
-            name: p.pickupPoint || p.pickupAddress || p.address || `Stop ${i + 1}`,
-            passengerName: p.passengerName || p.name || "Passenger",
-            phone: p.phone || "",
-            status: p.status || "pending",
-            coordinate: coord,
-          };
-        });
-
-        // Driver's confirmed home/starting location (fallback to Islamabad center)
-        const dLat = driverProfile?.homeLatitude || driverProfile?.latitude || currentLocation?.latitude || 33.6844;
-        const dLng = driverProfile?.homeLongitude || driverProfile?.longitude || currentLocation?.longitude || 73.0479;
-
-        // Sort passengers by proximity from driver home — nearest first
-        const sortedStops = sortByProximity(rawStops, dLat, dLng);
-
-        // ── Driver origin stop ────────────────────────────────────────────────
-        const driverOriginStop = {
-          _id: 'driver-origin',
-          _isDriverOrigin: true,
-          passengerId: null,
-          name: 'Driver Start Location',
-          passengerName: 'Driver',
-          phone: '',
-          status: 'picked',
-          coordinate: { latitude: dLat, longitude: dLng },
-        };
-        const stopsWithOrigin = [driverOriginStop, ...sortedStops];
-        setRouteStops(stopsWithOrigin);
-
-        // ── CRITICAL FIX: Only reset van to driver home on FRESH start ───────
-        // If route is already in_progress and simulation is running, do NOT
-        // override currentLocation — it would jump the van back to driver home
-        // on every 30s poll. Only set it when route hasn't started yet.
-        if (first.status !== 'in_progress') {
-          setCurrentLocation({ latitude: dLat, longitude: dLng });
+        // Get polyline from DB if driver has already generated it
+        if (route.encodedPolyline && !encodedPolyline) {
+          setEncodedPolyline(route.encodedPolyline);
         }
 
-        if (first.status === "in_progress") {
-          setRouteStarted(true);
-          const picked = (first.passengers || [])
-            .filter(p => p.status === "picked")
-            .map(p => p._id?.toString());
-          setCompletedStops(picked);
-          setCurrentStopIndex(picked.length);
+        const passengers = route.passengers || [];
+        setAllPassengers(passengers);
+        setTotalPassengers(passengers.length);
 
-          const tripId = first.tripId || first._id?.toString();
-          if (tripId) {
-            activeTripIdRef.current = tripId;
-            if (socketRef.current?.connected) socketRef.current.emit("joinTrip", { tripId, userId: driverIdRef.current });
-          }
+        const myIdx   = passengers.findIndex(p =>
+          (p.passengerId?.toString() || p._id?.toString()) === id
+        );
+        setMyStopIndex(myIdx);
+        const myEntry = myIdx >= 0 ? passengers[myIdx] : null;
+        setMyPassengerEntry(myEntry || null);
 
-          // ✅ RESTORE simulation position (seg + lat/lng) so van doesn't jump
-          // back to driver home after logout/login on the same device.
-          try {
-            const [[, rSeg], [, rProg], [, rLat], [, rLng]] = await AsyncStorage.multiGet([
-              PERSIST_SIM_SEGMENT, PERSIST_SIM_PROGRESS, PERSIST_SIM_LAT, PERSIST_SIM_LNG,
-            ]);
-            const restoredSeg = parseInt(rSeg, 10);
-            if (!isNaN(restoredSeg) && restoredSeg > 0) {
-              isRestoringRef.current  = true;
-              simSegmentRef.current   = restoredSeg;
-              simProgressRef.current  = parseFloat(rProg) || 0;
-              const rLatN = parseFloat(rLat);
-              const rLngN = parseFloat(rLng);
-              if (!isNaN(rLatN) && !isNaN(rLngN)) {
-                setCurrentLocation({ latitude: rLatN, longitude: rLngN });
-              }
-              console.log(`[Driver] 🔄 Sim position restored: seg=${restoredSeg}`);
-            }
-          } catch (e) { console.warn('[Driver] sim position restore error:', e); }
+        if (myEntry?.status === "picked") {
+          setBoarded(true);
+          setVanArrived(false);
+          setBoardingPending(false);
+          clearInterval(simRef.current);
+          AsyncStorage.multiRemove([PKEY_VAN_ARRIVED, PKEY_VAN_STOP_ID, PKEY_VAN_ROUTE_ID]).catch(() => {});
+        }
 
-          // ✅ RESTORE: If there's a persisted waitingAtStop for this route,
-          // keep simulation paused. This covers app restart mid-pickup.
-          try {
-            const [[, sw], [, sr]] = await AsyncStorage.multiGet([
-              PERSIST_WAITING_STOP, PERSIST_WAITING_ROUTE,
-            ]);
-            if (sw && sr === first._id?.toString()) {
-              // Verify this stop is still pending in fresh data
-              const stillPending = (first.passengers || []).find(
-                p => p._id?.toString() === sw && p.status !== "picked" && p.status !== "missed"
-              );
-              if (stillPending) {
-                simPausedRef.current = true;
-                setWaitingAtStop(sw);
-                const [[, spc]] = await AsyncStorage.multiGet([PERSIST_PASSENGER_CONF]);
-                if (spc) {
-                  setPassengerConfirmedForStop(spc);
-                  passengerConfirmedRef.current = spc;
-                }
-                console.log("[Driver] 🔄 Route in_progress — restored waitingAtStop:", sw);
-              } else {
-                // Stop was picked/missed externally — clear stale persisted state
-                AsyncStorage.multiRemove([PERSIST_WAITING_STOP, PERSIST_WAITING_ROUTE, PERSIST_PASSENGER_CONF]).catch(() => { });
-              }
-            }
-          } catch { }
+        const before = myIdx >= 0 ? passengers.slice(0, myIdx) : [];
+        setPickedBeforeMe(before.filter(p => p.status === "picked").length);
+        setIsNextPickup(
+          route.status === "in_progress" &&
+          before.filter(p => p.status !== "picked").length === 0 &&
+          myEntry?.status !== "picked" && myIdx >= 0
+        );
+
+        stopsRef.current = (passengers || []).map((p, i) => ({
+          _id:        p._id?.toString() || `p-${i}`,
+          name:       p.pickupPoint || p.pickupAddress || `Stop ${i + 1}`,
+          coordinate: resolvePassengerCoord(p, i),
+        }));
+
+        const drv = route.assignedDriver;
+        if (drv && typeof drv === "object" && drv.name) {
+          // Populated object — use directly
+          setRouteDriver(drv);
+          setDriverInfo({
+            name:          drv.name          || "Driver",
+            rating:        drv.rating        || 4.8,
+            vehicleNumber: drv.vehicleNo     || drv.vehicleNumber || "N/A",
+            vehicleModel:  drv.vehicleType   || drv.vehicleModel  || "Van",
+            latitude:      drv.latitude      || drv.location?.coordinates?.[1] || null,
+            longitude:     drv.longitude     || drv.location?.coordinates?.[0] || null,
+          });
+        } else if (route.driverName) {
+          // Fallback: driverName is a plain string stored on route
+          setRouteDriver({ _id: route.assignedDriver, name: route.driverName });
+          setDriverInfo({
+            name:          route.driverName,
+            rating:        4.8,
+            vehicleNumber: route.vehicleNumber || route.vehicleNo || "N/A",
+            vehicleModel:  route.vehicleType   || "Van",
+            latitude:      null,
+            longitude:     null,
+          });
         }
       } else {
-        // ── CRITICAL FIX: Never kill an active route on empty API response ──
-        // If routeStarted is true (simulation running) but API returns empty,
-        // this is likely a momentary network error or auth flicker.
-        // Resetting state here would stop the running simulation.
-        // Only reset if we are NOT currently running a route.
-        if (!routeStarted) {
-          setCurrentRoute(null);
-          setRouteStops([]);
-          setCompletedStops([]);
-          setCurrentStopIndex(0);
+        setAssignedRoute(prev => {
+          if (prev && prev.status === "in_progress") {
+            setTripCompleted(true);
+            setTimeout(() => setTripCompleted(false), 8000);
+          }
+          return null;
+        });
+        setMyPassengerEntry(null);
+        setIsNextPickup(false);
+        setVanPos(null);
+      }
+    } catch (e) { console.error("fetchAssignedRoute:", e); }
+  };
+
+  const fetchActivePolls = async (tok, uid) => {
+    const t = tok || userTokenRef.current, id = uid || userIdRef.current;
+    if (!t || !id) return;
+    try {
+      const res  = await fetch(`${API_BASE_URL}/polls/active`, { headers: getHeaders(t) });
+      const data = await res.json();
+      if (data.success && data.polls?.length > 0) {
+        setActivePolls(data.polls);
+        const unanswered = data.polls.filter(poll => {
+          if (poll.status !== "active") return false;
+          if (shownPollIds.current.has(poll._id?.toString())) return false;
+          return !poll.responses?.find(r => {
+            const rid = r.passengerId?._id?.toString() || r.passengerId?.toString() || r.passengerId;
+            return rid === id;
+          });
+        });
+        if (unanswered.length > 0 && !showPollModal) {
+          const poll = unanswered[0];
+          shownPollIds.current.add(poll._id?.toString());
+          setSelectedPoll(poll);
+          setLoadingResponse("");
+          setShowPollModal(true);
+          animateAlert(pollSlideAnim, pollPulseAnim);
         }
-        // routeStarted is intentionally NOT set to false here — the route is
-        // still active on the backend (in_progress). It will show up again on
-        // the next poll when network is restored.
-      }
-    } catch (e) { console.error("fetchAssignedRoutes:", e); }
-  }, [getHeaders]);
-
-  const fetchAvailabilityHistory = useCallback(async (uid, tok) => {
-    try {
-      const id = uid || driverIdRef.current;
-      const tkn = tok || authTokenRef.current;
-      if (!id) return;
-      const r = await fetch(`${API_BASE_URL}/driver-availability?driverId=${id}`, { headers: getHeaders(tkn) });
-      const d = await r.json();
-      if (d.success) {
-        const all = d.availability || d.availabilities || [];
-        setAvailabilityHistory(all);
-        const today = new Date().toISOString().split("T")[0];
-        const active = all.filter(a => new Date(a.date).toISOString().split("T")[0] >= today && a.status === "available");
-        if (active.length > 0) { setAvailable(true); setActiveAvailabilityRecord(active[0]); }
-        else setAvailable(false);
-      }
-    } catch { }
-  }, [getHeaders]);
-
-  const fetchPayments = async (uid, tok) => {
-    try {
-      const r = await fetch(`${API_BASE_URL}/payments`, { headers: getHeaders(tok) });
-      const d = await r.json();
-      if (d.success) setPaymentData(d.payments || d.data || []);
-    } catch { }
+      } else { setActivePolls([]); }
+    } catch {}
   };
 
-  const fetchTrips = async (uid, tok) => {
+  const fetchNotifications = async (tok, uid) => {
+    const t = tok || userTokenRef.current, id = uid || userIdRef.current;
+    if (!t || !id) return;
     try {
-      // Use driver ride-history which correctly filters by driverId
-      const r = await fetch(`${API_BASE_URL}/trips/driver/ride-history`, { headers: getHeaders(tok) });
-      const d = await r.json();
-      if (d.success) setTrips(d.rides || d.data || []);
-    } catch { }
-  };
-
-  const fetchSupportTickets = async (uid, tok) => {
-    try {
-      const r = await fetch(`${API_BASE_URL}/complaints`, { headers: getHeaders(tok) });
-      const d = await r.json();
-      if (d.success) setSupportTickets(d.complaints || d.data || []);
-    } catch { }
-  };
-
-  // ── Fetch monthly feedback window status ─────────────────────────────────
-  const fetchFeedbackWindow = async (tok) => {
-    try {
-      const r = await fetch(`${API_BASE_URL}/feedback/monthly-window`, { headers: getHeaders(tok) });
-      const d = await r.json();
-      if (d.success) setFeedbackWindow(d);
-    } catch { }
-  };
-
-  // ── Submit monthly feedback ───────────────────────────────────────────────
-  const FEEDBACK_QUESTIONS = [
-    'How would you rate your overall driving experience this month?',
-    'How satisfied are you with the route assigned to you?',
-    'How would you rate communication with your transporter?',
-    'How satisfied are you with your payment timelines?',
-    'Would you recommend this service to other drivers?',
-  ];
-  const RATING_OPTIONS = ['Excellent', 'Good', 'Average', 'Poor', 'Very Poor'];
-
-  const handleFeedbackSubmit = async () => {
-    if (!feedbackSubject.trim()) {
-      Alert.alert('Subject Required', 'Please enter a subject for your feedback.');
-      return;
-    }
-    const allAnswered = FEEDBACK_QUESTIONS.every((_, i) => feedbackAnswers[i]);
-    if (!allAnswered) {
-      Alert.alert('Incomplete', 'Please answer all questions before submitting.');
-      return;
-    }
-    setFeedbackSaving(true);
-    try {
-      const tok = authTokenRef.current;
-      const questions = FEEDBACK_QUESTIONS.map((q, i) => ({ question: q, answer: feedbackAnswers[i] }));
-      const res = await fetch(`${API_BASE_URL}/feedback/monthly`, {
-        method: 'POST',
-        headers: { ...getHeaders(tok), 'Content-Type': 'application/json' },
-        body: JSON.stringify({ subject: feedbackSubject.trim(), date: new Date().toISOString(), questions }),
-      });
+      const res  = await fetch(`${API_BASE_URL}/notifications`, { headers: getHeaders(t) });
       const data = await res.json();
       if (data.success) {
-        setFeedbackSubmitted(true);
-      } else {
-        Alert.alert('Error', data.message || 'Could not submit feedback.');
-      }
-    } catch {
-      Alert.alert('Error', 'Could not connect to server.');
-    } finally {
-      setFeedbackSaving(false);
-    }
-  };
-
-  const fetchNotifications = async (uid, tok) => {
-    try {
-      const r = await fetch(`${API_BASE_URL}/notifications`, { headers: getHeaders(tok) });
-      const d = await r.json();
-      if (d.success) {
-        const n = d.notifications || d.data || [];
+        const n = data.notifications || data.data || [];
         setNotifications(n);
         setUnreadCount(n.filter(x => !x.read).length);
       }
-    } catch { }
+    } catch {}
   };
 
-  // ── Simulation engine ─────────────────────────────────────────────────────
-  //
-  // KEY DESIGN DECISIONS (fixes the passenger-skip + button-missing bugs):
-  //
-  // 1. Read from routeStopsRef.current (not routeStops) — avoids stale closure.
-  //    Status changes applied via setRouteStops() are immediately visible here.
-  //
-  // 2. while-loop skips already-picked/missed stops sequentially on every tick.
-  //    Because the ref is live, newly-picked stops are skipped correctly.
-  //
-  // 3. Simulation PAUSES (simPausedRef = true) when the van arrives at a stop.
-  //    It will NOT unpause itself — only pickupPassenger() can unpause it.
-  //
-  // 4. Multi-level alerts: 10 → 5 → 3 → 1 min before each stop.
-  //    Each level fires exactly once per stop (keyed in alertedStopsRef).
-  //
-  const startSimulation = () => {
-    const restoring = isRestoringRef.current;
-    isRestoringRef.current = false;
-    simTickRef.current     = 0;
-    routeEndingRef.current = false;  // reset so next route can auto-complete
-
-    if (!restoring) {
-      // Fresh start — clear interval and reset to beginning
-      stopSimulation();
-      simSegmentRef.current  = 0;
-      simProgressRef.current = 0;
-    } else {
-      // Resuming after logout/login — keep saved segment & progress,
-      // just clear the interval so we create a fresh one below
-      if (simIntervalRef.current) { clearInterval(simIntervalRef.current); simIntervalRef.current = null; }
-      console.log(`[Sim] ▶ Resuming from seg=${simSegmentRef.current} progress=${simProgressRef.current.toFixed(3)}`);
-    }
-    simPausedRef.current = false;
-    alertedStopsRef.current = new Set();
-
-
-
-      // LAST STOP AUTO-COMPLETE
-      const passengerStops = routeStopsRef.current.filter(s => s._isDriverOrigin !== true);
-      const passengerCount = passengerStops.length;
-    
-      simIntervalRef.current = setInterval(() => {
-        if (simPausedRef.current) return;
-
-        const currentStops = routeStopsRef.current;
-        if (!currentStops || currentStops.length < 2) { stopSimulation(); return; }
-
-        const totalSegments = currentStops.length - 1;
-        let seg = simSegmentRef.current;
-
-        // Sequential skip + progress
-        while (seg < totalSegments) {
-          const dest = currentStops[seg + 1];
-          if (dest?.status === "picked" || dest?.status === "missed") {
-            console.log(`[Sim] Skipping ${seg + 1}: ${dest?.passengerName}`);
-            seg += 1;
-            simSegmentRef.current = seg;
-            simProgressRef.current = 0;
-          } else break;
-        }
-
-        const passengerStops = currentStops.filter(s => !s._isDriverOrigin);
-        const passengerCount = passengerStops.length;
-        if (seg >= passengerCount) {
-          if (!routeEndingRef.current) {
-            routeEndingRef.current = true;
-            simPausedRef.current   = true; // stop repeating before alert shows
-            console.log('[Sim] 🎉 ALL COMPLETE → END ROUTE');
-            completeRouteRef.current?.();  // always latest version, never stale
-          }
-          return;
-        }
-
-        // Check arrival at stop — skip driver origin (status already 'picked')
-        const arrivedStop = currentStops[seg];
-        if (
-          arrivedStop &&
-          !arrivedStop._isDriverOrigin &&
-          arrivedStop.status !== 'picked' &&
-          arrivedStop.status !== 'missed'
-        ) {
-          simPausedRef.current = true;
-          setCurrentLocation(arrivedStop.coordinate);
-          setWaitingAtStop(arrivedStop._id);
-          setPassengerConfirmedForStop(null);
-          AsyncStorage.multiSet([
-            [PERSIST_WAITING_STOP, arrivedStop._id?.toString()],
-            [PERSIST_WAITING_ROUTE, currentRoute?._id?.toString() || ''],
-            [PERSIST_PASSENGER_CONF, ''],
-          ]).catch(() => { });
-          console.log(`[Sim] ⏸ Paused at ${arrivedStop.passengerName}`);
-          return;
-        }
-
-        // Sequential skip: advance past already-completed stops
-        while (seg < totalSegments) {
-          const dest = currentStops[seg + 1];
-          if (dest.status === "picked" || dest.status === "missed") {
-            console.log(`[Sim] Skipping ${seg + 1}: ${dest.passengerName}`);
-            seg += 1;
-            simSegmentRef.current = seg;
-            simProgressRef.current = 0;
-          } else break;
-        }
-
-        if (seg >= totalSegments) { stopSimulation(); return; }
-
-        const segDistKm = haversineKm(
-          currentStops[seg].coordinate.latitude, currentStops[seg].coordinate.longitude,
-          currentStops[seg + 1].coordinate.latitude, currentStops[seg + 1].coordinate.longitude
+  const fetchCurrentTrip = async (tok, uid) => {
+    const t = tok || userTokenRef.current, id = uid || userIdRef.current;
+    if (!t || !id) return;
+    try {
+      const res  = await fetch(`${API_BASE_URL}/trips`, { headers: getHeaders(t) });
+      const data = await res.json();
+      if (data.success && data.trips?.length > 0) {
+        const myTrips = data.trips.filter(trip =>
+          trip.passengers?.some(p => {
+            const pId = p._id?._id?.toString() || p._id?.toString() || p._id;
+            return pId === id;
+          })
         );
-        const kmPerTick = (ASSUMED_SPEED_KMH * SIM_INTERVAL_MS) / 3600000;
-        const stepFraction = segDistKm > 0 ? kmPerTick / segDistKm : 0.08;
-
-        simProgressRef.current += stepFraction;
-
-        if (simProgressRef.current >= 1) {
-          simProgressRef.current = 0;
-          simSegmentRef.current = seg + 1;
-          seg = simSegmentRef.current;
-
-          if (seg >= totalSegments) {
-            // ── Arrived at the very last stop ──────────────────────────────
-            // With driver-origin prepended: totalSegments === passengerCount.
-            // When seg === totalSegments we've just arrived at the last passenger.
-            // We must PAUSE here exactly like any other stop (not auto-complete).
-            // Only after the driver presses "Confirm Pickup" does pickupPassenger()
-            // resume the sim, and the top-of-loop passengerCount check fires to
-            // call completeRoute() on the very next tick.
-            const lastStop = currentStops[seg];
-            if (
-              lastStop &&
-              !lastStop._isDriverOrigin &&
-              lastStop.status !== 'picked' &&
-              lastStop.status !== 'missed'
-            ) {
-              // Pause at last stop — same flow as every other stop
-              simPausedRef.current = true;
-              setCurrentLocation(lastStop.coordinate);
-              setWaitingAtStop(lastStop._id);
-              setPassengerConfirmedForStop(null);
-              AsyncStorage.multiSet([
-                [PERSIST_WAITING_STOP, lastStop._id?.toString()],
-                [PERSIST_WAITING_ROUTE, currentRoute?._id?.toString() || ''],
-                [PERSIST_PASSENGER_CONF, ''],
-              ]).catch(() => {});
-              console.log(`[Sim] ⏸ Pause at LAST STOP: ${lastStop.passengerName}`);
-              if (socketRef.current?.connected && activeTripIdRef.current) {
-                socketRef.current.emit('boardingRequest', {
-                  tripId: activeTripIdRef.current,
-                  routeId: currentRoute?._id,
-                  passengerId: lastStop.passengerId,
-                  passengerName: lastStop.passengerName,
-                  stopName: lastStop.name,
-                  stopId: lastStop._id,
-                });
-              }
-            } else {
-              // Last stop already picked/missed — finish the route
-              setCurrentLocation(currentStops[currentStops.length - 1].coordinate);
-              if (!routeEndingRef.current) {
-                routeEndingRef.current = true;
-                simPausedRef.current   = true;
-                completeRouteRef.current?.();
-              }
+        const active = myTrips.find(tr => ["Scheduled","En Route","Ready","ongoing","active"].includes(tr.status));
+        if (active) {
+          const tripId = active._id?.toString();
+          if (tripId && activeTripIdRef.current !== tripId) {
+            activeTripIdRef.current = tripId;
+            if (socketRef.current?.connected) {
+              socketRef.current.emit("joinRide",  { rideId: tripId, userId: userIdRef.current, role: "passenger" });
+              socketRef.current.emit("joinTrip",  { tripId, userId: userIdRef.current });
+              if (userIdRef.current) socketRef.current.emit("joinUser", { userId: userIdRef.current });
+              console.log("[Socket] Passenger joined trip room:", tripId);
             }
-            return;
           }
-
-          // ── Arrived at an intermediate passenger stop ───────────────────
-          const arrivedStop = currentStops[seg];
-          if (
-            arrivedStop &&
-            !arrivedStop._isDriverOrigin &&
-            arrivedStop.status !== 'picked' &&
-            arrivedStop.status !== 'missed'
-          ) {
-            simPausedRef.current = true;
-            setCurrentLocation(arrivedStop.coordinate);
-            setWaitingAtStop(arrivedStop._id);
-            setPassengerConfirmedForStop(null);
-            AsyncStorage.multiSet([
-              [PERSIST_WAITING_STOP, arrivedStop._id?.toString()],
-              [PERSIST_WAITING_ROUTE, currentRoute?._id?.toString() || ''],
-              [PERSIST_PASSENGER_CONF, ''],
-            ]).catch(() => {});
-            console.log(`[Sim] ⏸ Pause ${arrivedStop.passengerName}`);
-            if (socketRef.current?.connected && activeTripIdRef.current) {
-              socketRef.current.emit('boardingRequest', {
-                tripId: activeTripIdRef.current,
-                routeId: currentRoute?._id,
-                passengerId: arrivedStop.passengerId,
-                passengerName: arrivedStop.passengerName,
-                stopName: arrivedStop.name,
-                stopId: arrivedStop._id,
-              });
-            }
-            return;
+          // Get trip polyline too
+          if (active.encodedPolyline && !encodedPolyline) {
+            setEncodedPolyline(active.encodedPolyline);
           }
-        }
-
-        const pos = interpolate(
-          currentStops[seg].coordinate,
-          currentStops[seg + 1].coordinate,
-          simProgressRef.current
-        );
-        setCurrentLocation(pos);
-
-        // ── Persist sim position every 3 ticks so login/logout doesn't reset van ──
-        simTickRef.current += 1;
-        if (simTickRef.current % 3 === 0) {
-          AsyncStorage.multiSet([
-            [PERSIST_SIM_SEGMENT,  simSegmentRef.current.toString()],
-            [PERSIST_SIM_PROGRESS, simProgressRef.current.toFixed(6)],
-            [PERSIST_SIM_LAT,      pos.latitude.toFixed(7)],
-            [PERSIST_SIM_LNG,      pos.longitude.toFixed(7)],
-          ]).catch(() => {});
-        }
-
-        // Broadcast van location
-        const tripId = activeTripIdRef.current;
-        if (socketRef.current?.connected && tripId) {
-          socketRef.current.emit("tripLocationUpdate", {
-            tripId,
-            routeId: currentRoute?._id,
-            latitude: pos.latitude,
-            longitude: pos.longitude,
-            speed: ASSUMED_SPEED_KMH,
+          const lat = active.currentLocation?.latitude;
+          const lng = active.currentLocation?.longitude;
+          if (lat != null && lng != null) {
+            setVanPos({ latitude: Number(lat), longitude: Number(lng) });
+            setUseLiveTripLocation(true);
+          } else {
+            setUseLiveTripLocation(false);
+          }
+          const myP = active.passengers?.find(p => {
+            const pId = p._id?._id?.toString() || p._id?.toString() || p._id;
+            return pId === id;
           });
-        }
-
-        // Multi-level proximity alerts: 10 → 5 → 3 → 1 min
-        const nextStopIdx = seg + 1;
-        const nextStop = currentStops[nextStopIdx];
-        if (nextStop && nextStop.status !== "picked" && nextStop.status !== "missed") {
-          const distToNext = haversineKm(
-            pos.latitude, pos.longitude,
-            nextStop.coordinate.latitude, nextStop.coordinate.longitude
-          );
-
-          const thresholds = [
-            { km: TEN_MIN_KM, alertLevel: 10 },
-            { km: FIVE_MIN_KM, alertLevel: 5 },
-            { km: THREE_MIN_KM, alertLevel: 3 },
-            { km: ONE_MIN_KM, alertLevel: 1 },
-          ];
-
-          for (const { km, alertLevel } of thresholds) {
-            const key = `${nextStopIdx}_${alertLevel}`;
-            if (distToNext <= km && !alertedStopsRef.current.has(key)) {
-              alertedStopsRef.current.add(key);
-              const etaMin = Math.max(1, Math.round((distToNext / ASSUMED_SPEED_KMH) * 60));
-              console.log(`[Sim] ${alertLevel}-min alert → stop ${nextStopIdx} (${nextStop.passengerName})`);
-
-              if (socketRef.current?.connected && tripId) {
-                socketRef.current.emit("tenMinAlert", {
-                  tripId,
-                  routeId: currentRoute?._id,
-                  passengerId: nextStop.passengerId,
-                  passengerName: nextStop.passengerName,
-                  stopName: nextStop.name,
-                  stopId: nextStop._id,
-                  etaMin,
-                  alertLevel,  // 10 | 5 | 3 | 1
-                });
-              }
-            }
+          if (active.status === "Ready" && !myP?.confirmedMorning && !showMorningConf) {
+            setShowMorningConf(true);
+            setMorningTrip(active);
+            animateAlert(morningSlideAnim, morningPulseAnim);
           }
         }
-      }, SIM_INTERVAL_MS);
-    };
-
-    // clearAll=true only when route actually COMPLETES — preserves sim position
-    // across logout/login (clearAll=false, default) so van resumes correctly.
-    const stopSimulation = (clearAll = false) => {
-      if (simIntervalRef.current) { clearInterval(simIntervalRef.current); simIntervalRef.current = null; }
-      simPausedRef.current = false;
-      setWaitingAtStop(null);
-      setPassengerConfirmedForStop(null);
-      if (clearAll) {
-        // Route truly finished — wipe all persisted state including position
-        AsyncStorage.multiRemove([
-          PERSIST_WAITING_STOP, PERSIST_WAITING_ROUTE, PERSIST_PASSENGER_CONF,
-          PERSIST_ROUTE_STARTED, PERSIST_ACTIVE_TRIP,
-          PERSIST_SIM_SEGMENT, PERSIST_SIM_PROGRESS, PERSIST_SIM_LAT, PERSIST_SIM_LNG,
-        ]).catch(() => {});
       } else {
-        // Logout/unmount — only clear pickup state, keep sim position for resume
-        AsyncStorage.multiRemove([
-          PERSIST_WAITING_STOP, PERSIST_WAITING_ROUTE, PERSIST_PASSENGER_CONF,
-          PERSIST_ROUTE_STARTED, PERSIST_ACTIVE_TRIP,
-        ]).catch(() => {});
+        setUseLiveTripLocation(false);
       }
-    };
+    } catch {}
+  };
 
-    // ── syncRouteLocation ─────────────────────────────────────────────────────
-    const syncRouteLocation = useCallback(async (payload) => {
-      if (!currentRoute?._id) return;
-      const now = Date.now();
-      if (now - lastLocationSyncRef.current >= 5000) {
-        lastLocationSyncRef.current = now;
-        try {
-          await fetch(`${API_BASE_URL}/trips/${activeTripIdRef.current}/location`, {
-            method: "PUT", headers: getHeaders(),
-            body: JSON.stringify(payload),
-          });
-        } catch { }
-      }
-      if (now - lastSocketEmit.current >= SOCKET_EMIT_MS) {
-        lastSocketEmit.current = now;
-        if (socketRef.current?.connected) {
-          socketRef.current.emit("tripLocationUpdate", {
-            tripId: activeTripIdRef.current,
-            routeId: currentRoute._id,
-            ...payload,
-          });
-        }
-      }
-    }, [currentRoute?._id, getHeaders]);
-
-    // ── Route actions ─────────────────────────────────────────────────────────
-    const confirmAvailability = async () => {
-      const tomorrow = new Date();
-      tomorrow.setDate(tomorrow.getDate() + 1);
-      try {
-        setLoading(true);
-        const r = await fetch(`${API_BASE_URL}/driver-availability`, {
-          method: "POST", headers: getHeaders(),
-          body: JSON.stringify({
-            date: tomorrow.toISOString().split("T")[0],
-            startTime, endTime, status: "available",
-          }),
-        });
-        const d = await r.json();
-        if (d.success) {
-          setAvailable(true);
-          await fetchAvailabilityHistory(driverIdRef.current, authTokenRef.current);
-          Alert.alert("Done ✅", "Availability confirmed for tomorrow!");
-        }
-      } catch { Alert.alert("Error", "Could not connect to server"); }
-      finally { setLoading(false); }
-    };
-
-    const startRoute = useCallback(async () => {
-      if (!currentRoute) { Alert.alert("No Route", "No route assigned to start."); return; }
-
-      // ✅ TIME RESTRICTION DISABLED — Driver can start route anytime.
-      // To re-enable scheduling in future, uncomment the block below.
-      /*
-      const scheduledTime = currentRoute.routeStartTime || currentRoute.pickupTime || currentRoute.timeSlot;
-      if (scheduledTime) {
-        const routeTime = parseTimeToday(scheduledTime);
-        if (routeTime) {
-          const diffMs = routeTime - new Date();
-          const diffMins = Math.round(diffMs / 60000);
-          if (diffMins > 2) {
-            Alert.alert(
-              "⏰ Too Early to Start",
-              `This route is scheduled for ${scheduledTime}.\n\nYou can start in ${formatCountdown(diffMs)}.`,
-              [{ text: "OK, Got It" }]
-            );
-            return;
-          }
-        }
-      }
-      */
-
-      Alert.alert("Start Route", `Start "${currentRoute.routeName || currentRoute.name}"?`, [
-        { text: "Cancel", style: "cancel" },
-        {
-          text: "Start", onPress: async () => {
-            setLoading(true);
-            try {
-              const res = await fetch(`${API_BASE_URL}/routes/${currentRoute._id}/start`, { method: "POST", headers: getHeaders() });
-              const data = await res.json();
-              if (data.success) {
-                const tripId = data.trip?._id?.toString();
-                activeTripIdRef.current = tripId;
-                if (socketRef.current?.connected && tripId) socketRef.current.emit("joinTrip", { tripId, userId: driverIdRef.current });
-                setRouteStarted(true);
-                setCurrentRoute(prev => ({ ...prev, status: "in_progress", tripId }));
-                setCurrentStopIndex(0);
-                setCompletedStops([]);
-                // ✅ PERSIST route started state
-                // Clear old sim position — fresh start begins from driver home
-              AsyncStorage.multiRemove([
-                PERSIST_SIM_SEGMENT, PERSIST_SIM_PROGRESS, PERSIST_SIM_LAT, PERSIST_SIM_LNG,
-              ]).catch(() => {});
-              AsyncStorage.multiSet([
-                  [PERSIST_ROUTE_STARTED, "true"],
-                  [PERSIST_ACTIVE_TRIP, tripId || ""],
-                ]).catch(() => { });
-              } else {
-                Alert.alert("Cannot Start", data.message || "Could not start route.");
-              }
-            } catch (e) { Alert.alert("Error", "Could not connect to server."); }
-            finally { setLoading(false); }
-          }
-        },
-      ]);
-    }, [currentRoute, getHeaders]);
-
-    const completeRoute = useCallback(async () => {
-      if (!currentRoute) return;
-      const allHandled = routeStops.filter(s => s._isDriverOrigin !== true).every(
-        s => s.status === "picked" || s.status === "missed" || completedStops.includes(s._id)
+  // ── Board Van (manual UI button fallback) ─────────────────────────────────
+  const handleBoardVan = async () => {
+    if (!assignedRoute || !myPassengerEntry) return;
+    try {
+      setMarkingBoard(true);
+      const stopId = myPassengerEntry._id;
+      const res = await fetch(
+        `${API_BASE_URL}/routes/${assignedRoute._id}/stops/${stopId}/status`,
+        { method:"PUT", headers:getHeaders(), body:JSON.stringify({ status:"picked" }) }
       );
-      Alert.alert(
-        "Complete Route",
-        allHandled
-          ? `Complete route "${currentRoute.routeName || currentRoute.name}"?`
-          : "Some passengers are pending. End route anyway?",
-        [
-          { text: "Cancel", style: "cancel" },
-          {
-            text: allHandled ? "Complete ✅" : "End Anyway",
-            style: allHandled ? "default" : "destructive",
-            onPress: async () => {
-              setLoading(true);
-              try {
-                const res = await fetch(`${API_BASE_URL}/routes/${currentRoute._id}/end`, { method: "POST", headers: getHeaders() });
-                const data = await res.json();
-                if (data.success) {
-                  routeEndingRef.current = false; // allow future routes to auto-complete
-                  stopSimulation(true); // true = clear ALL persisted state incl. sim position
-                  setRouteStarted(false);
-                  setCurrentRoute(prev => ({ ...prev, status: "completed" }));
-                  setCompletedStops([]); setCurrentStopIndex(0);
-                  if (socketRef.current?.connected && activeTripIdRef.current) {
-                    socketRef.current.emit("routeCompleted", {
-                      tripId: activeTripIdRef.current,
-                      routeId: currentRoute._id,
-                    });
-                  }
-                  activeTripIdRef.current = null;
-                  Alert.alert("Route Completed ✅", "Trip finished! Stats are being updated.");
-                  await Promise.all([
-                    fetchAssignedRoutes(driverIdRef.current, authTokenRef.current),
-                    fetchDashboardStats(driverIdRef.current, authTokenRef.current),
-                    fetchTrips(driverIdRef.current, authTokenRef.current),
-                  ]);
-                } else { Alert.alert("Error", data.message || "Could not complete route."); }
-              } catch { Alert.alert("Error", "Could not connect to server."); }
-              finally { setLoading(false); }
-            }
-          },
-        ]
-      );
-    }, [currentRoute, routeStops, completedStops, getHeaders, fetchAssignedRoutes]);
-
-    // Keep completeRouteRef pointing to the latest completeRoute.
-    // The setInterval in startSimulation closes over a stale version —
-    // this ref ensures it always calls the current one with fresh state.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    React.useEffect(() => { completeRouteRef.current = completeRoute; }, [completeRoute]);
-
-    const markNotificationRead = async (id) => {
-      try {
-        await fetch(`${API_BASE_URL}/notifications/${id}/read`, { method: "PUT", headers: getHeaders() });
-        setNotifications(prev => prev.map(n => n._id === id ? { ...n, read: true } : n));
-        setUnreadCount(prev => Math.max(0, prev - 1));
-      } catch { }
-    };
-
-    const submitSupportTicket = async () => {
-      if (!ticketSubject.trim() || !ticketDescription.trim()) {
-        Alert.alert("Error", "Please fill in all fields."); return;
-      }
-      try {
-        setLoading(true);
-        const r = await fetch(`${API_BASE_URL}/complaints`, {
-          method: "POST", headers: getHeaders(),
-          body: JSON.stringify({ subject: ticketSubject, description: ticketDescription }),
-        });
-        const d = await r.json();
-        if (d.success) {
-          Alert.alert("Ticket Submitted ✅", "We'll get back to you soon.");
-          setNewTicketVisible(false); setTicketSubject(""); setTicketDescription("");
-          fetchSupportTickets(driverIdRef.current, authTokenRef.current);
-        } else Alert.alert("Error", d.message || "Could not submit.");
-      } catch { Alert.alert("Error", "Network error."); }
-      finally { setLoading(false); }
-    };
-
-    // ── Chat ──────────────────────────────────────────────────────────────────
-    const fetchChatMessages = useCallback(async (otherId) => {
-      if (!otherId) return;
-      try {
-        const myId = driverIdRef.current;
-        const r = await fetch(`${API_BASE_URL}/messages/${otherId}`, { headers: getHeaders() });
-        const d = await r.json();
-        if (d.success) {
-          setChatMessages((d.messages || []).map(m => ({
-            _id: m._id,
-            text: m.text,
-            fromMe: m.senderId?.toString() === myId,
-            isQuickReply: m.isQuickReply || false,
-            time: new Date(m.createdAt).toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit" }),
-          })));
-          fetch(`${API_BASE_URL}/messages/${otherId}/read`, { method: "PUT", headers: getHeaders() }).catch(() => { });
+      const data = await res.json();
+      if (data.success) {
+        setBoarded(true);
+        setVanArrived(false);
+        setBoardingPending(false);
+        clearInterval(simRef.current);
+        AsyncStorage.multiRemove([PKEY_VAN_ARRIVED, PKEY_VAN_STOP_ID, PKEY_VAN_ROUTE_ID]).catch(() => {});
+        // Emit passengerBoarded to unblock driver simulation
+        if (socketRef.current?.connected && activeTripIdRef.current) {
+          socketRef.current.emit("passengerBoarded", {
+            tripId:      activeTripIdRef.current,
+            passengerId: userIdRef.current,
+            status:      "picked",
+          });
         }
-      } catch (e) { console.warn("fetchChatMessages:", e); }
-    }, [getHeaders]);
-
-    const openDriverChat = useCallback(async (otherUser) => {
-      if (!otherUser?._id) return;
-      setChatOtherUser(otherUser);
-      setChatMessages([]);
-      setUnreadMsgCount(0);
-      await fetchChatMessages(otherUser._id);
-      setCurrentView("Messages");
-      if (chatPollRef.current) clearInterval(chatPollRef.current);
-      chatPollRef.current = setInterval(() => fetchChatMessages(otherUser._id), 4000);
-    }, [fetchChatMessages]);
-
-    const openChatWithTransporter = useCallback(() => {
-      if (networkTransporter?._id) {
-        openDriverChat({ _id: networkTransporter._id, name: networkTransporter.name, role: "transporter" });
+        Alert.alert("✅ Boarded!", "You're on the vehicle. Enjoy your ride!", [{ text:"OK" }]);
+        await fetchAssignedRoute(userTokenRef.current, userIdRef.current);
       } else {
-        Alert.alert("No Transporter", "You are not assigned to a transporter yet.");
+        Alert.alert("Error", data.message || "Could not mark as boarded.");
       }
-    }, [networkTransporter, openDriverChat]);
+    } catch { Alert.alert("Error", "Connection failed."); }
+    finally { setMarkingBoard(false); }
+  };
 
-    const closeDriverChat = () => {
-      if (chatPollRef.current) { clearInterval(chatPollRef.current); chatPollRef.current = null; }
-      setChatOtherUser(null);
-      setChatMessages([]);
-      setCurrentView("Dashboard");
-    };
-
-    const handleDriverChatSend = useCallback(async (text, messageType = "quick_reply") => {
-      if (!text?.trim() || !chatOtherUser?._id || chatSending) return;
-
-      const tempMsg = {
-        _id: `tmp_${Date.now()}`, text: text.trim(), fromMe: true,
-        isQuickReply: messageType === "quick_reply",
-        time: new Date().toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit" }),
+  // ── Poll response ──────────────────────────────────────────────────────────
+  const submitPollResponse = async (responseValue) => {
+    if (!selectedPoll || !responseValue || loadingResponse) return;
+    try {
+      setLoadingResponse(responseValue);
+      const up   = userProfile;
+      const body = {
+        response: responseValue, selectedTimeSlot: null,
+        pickupPoint: up?.pickupPoint || pickupPoint || null,
+        pickupLat: up?.latitude || null, pickupLng: up?.longitude || null,
+        destination: up?.destination || null, dropLat: up?.destinationLatitude || null,
+        dropLng: up?.destinationLongitude || null, vehiclePreference: up?.vehiclePreference || null,
       };
-      setChatMessages(prev => [...prev, tempMsg]);
-      setChatSending(true);
+      const res  = await fetch(`${API_BASE_URL}/polls/${selectedPoll._id}/respond`, { method:"POST", headers:getHeaders(), body:JSON.stringify(body) });
+      const data = await res.json();
+      if (data.success) {
+        setShowPollModal(false); setSelectedPoll(null); setLoadingResponse("");
+        dismissAlert(pollSlideAnim, pollPulseAnim);
+        Alert.alert("Response Submitted ✅", responseValue === "yes" ? "You've confirmed travel." : "Confirmed — not traveling.", [{ text:"OK" }]);
+        await fetchActivePolls(userTokenRef.current, userIdRef.current);
+      } else { Alert.alert("Error", data.message || "Could not submit."); }
+    } catch { Alert.alert("Error", "Connection failed."); }
+    finally { setLoadingResponse(""); }
+  };
 
-      try {
-        const r = await fetch(`${API_BASE_URL}/messages`, {
-          method: "POST", headers: getHeaders(),
-          body: JSON.stringify({
-            receiverId: chatOtherUser._id,
-            text: text.trim(),
-            messageType,
-            routeId: currentRoute?._id || null,
-          }),
-        });
-        const d = await r.json();
-        if (d.success && d.message) {
-          const real = d.message;
-          setChatMessages(prev => prev.map(m => m._id === tempMsg._id ? {
-            _id: real._id, text: real.text, fromMe: true,
-            isQuickReply: real.isQuickReply || false,
-            time: new Date(real.createdAt).toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit" }),
-          } : m));
+  const submitMorningConf = async (willTravel) => {
+    if (!morningTrip) return;
+    try {
+      setLoading(true);
+      const res  = await fetch(`${API_BASE_URL}/trips/${morningTrip._id}/confirm-passenger`, { method:"POST", headers:getHeaders(), body:JSON.stringify({ traveling:willTravel }) });
+      const data = await res.json();
+      if (data.success) {
+        Alert.alert("Confirmed ✅", willTravel ? "Driver notified." : "Confirmed — not traveling today.", [{
+          text:"OK", onPress: () => {
+            setShowMorningConf(false);
+            setMorningTrip(null);
+            dismissAlert(morningSlideAnim, morningPulseAnim);
+          }
+        }]);
+      }
+    } catch { Alert.alert("Error", "Failed. Try again."); }
+    finally { setLoading(false); }
+  };
+
+  const markNotifRead = async (id) => {
+    try {
+      await fetch(`${API_BASE_URL}/notifications/${id}/read`, { method:"PUT", headers:getHeaders() });
+      setNotifications(prev => prev.map(n => n._id === id ? { ...n, read:true } : n));
+      setUnreadCount(prev => Math.max(0, prev - 1));
+    } catch {}
+  };
+
+  const animateAlert  = (sl, pl) => { sl.setValue(-200); Animated.parallel([Animated.timing(sl, { toValue:0, duration:500, useNativeDriver:true }), Animated.loop(Animated.sequence([Animated.timing(pl, { toValue:1.02, duration:1200, useNativeDriver:true }), Animated.timing(pl, { toValue:1, duration:1200, useNativeDriver:true })]))]).start(); };
+  const dismissAlert  = (sl, pl) => { pl.stopAnimation(); Animated.timing(sl, { toValue:-200, duration:300, useNativeDriver:true }).start(); };
+
+  const blinkOpacity   = blinkAnim.interpolate({ inputRange:[0,1], outputRange:[0.6,1] });
+  const cardTranslateY = cardAnim.interpolate({ inputRange:[0,1], outputRange:[50,0] });
+
+  const onRefresh = async () => {
+    setRefreshing(true);
+    await fetchAll(userTokenRef.current, userIdRef.current);
+    setRefreshing(false);
+  };
+
+  const chatPollRef = useRef(null);
+
+  const fetchChatMessages = async (driverId) => {
+    if (!driverId) return;
+    try {
+      const tok  = userTokenRef.current;
+      const myId = userIdRef.current;
+      const res  = await fetch(`${API_BASE_URL}/messages/${driverId}`, { headers: getHeaders(tok) });
+      const data = await res.json();
+      if (data.success) {
+        const msgs = (data.messages || []).map(m => ({
+          _id:          m._id,
+          text:         m.text,
+          fromDriver:   m.senderId?.toString() !== myId?.toString(),
+          fromMe:       m.senderId?.toString() === myId?.toString(),
+          isQuickReply: m.isQuickReply || false,
+          time: new Date(m.createdAt).toLocaleTimeString("en-US", { hour:"2-digit", minute:"2-digit" }),
+        }));
+        setChatMessages(msgs);
+        const myTyped = (data.messages || []).filter(
+          m => m.senderId?.toString() === myId?.toString() && m.messageType === "typed"
+        ).length;
+        setTypedCount(myTyped);
+        fetch(`${API_BASE_URL}/messages/${driverId}/read`, {
+          method: "PUT", headers: getHeaders(tok),
+        }).catch(() => {});
+        setTimeout(() => flatListRef.current?.scrollToEnd({ animated: true }), 100);
+      }
+    } catch (e) { console.warn("fetchChatMessages:", e); }
+  };
+
+  const openChatWithDriver = async () => {
+    const driverId = routeDriver?._id;
+    if (!driverId) { Alert.alert("No Driver", "Driver not assigned yet."); return; }
+    if (assignedRoute?.status !== "in_progress") {
+      Alert.alert("Chat Unavailable", "Chat is only available when the driver has started the route."); return;
+    }
+    setChatMessages([]);
+    setTypedCount(0);
+    setUnreadChatCount(0);
+    setChatVisible(true);
+    await fetchChatMessages(driverId);
+    if (chatPollRef.current) clearInterval(chatPollRef.current);
+    chatPollRef.current = setInterval(() => fetchChatMessages(driverId), 4000);
+  };
+
+  const closeChatWithDriver = () => {
+    setChatVisible(false);
+    setUnreadChatCount(0);
+    if (chatPollRef.current) { clearInterval(chatPollRef.current); chatPollRef.current = null; }
+  };
+
+  const sendMessage = async (text, messageType = "typed") => {
+    const msgText = text || inputText;
+    if (!msgText?.trim()) return;
+    const driverId = routeDriver?._id;
+    if (!driverId) { Alert.alert("Error", "No driver assigned."); return; }
+    if (chatSending) return;
+
+    const myId  = userIdRef.current;
+    const tempId = `tmp_${Date.now()}`;
+    const tempMsg = {
+      _id: tempId, text: msgText.trim(), fromDriver: false, fromMe: true,
+      isQuickReply: messageType === "quick_reply",
+      time: new Date().toLocaleTimeString("en-US", { hour:"2-digit", minute:"2-digit" }),
+    };
+    setChatMessages(prev => [...prev, tempMsg]);
+    if (messageType === "typed") setTypedCount(prev => prev + 1);
+    setInputText("");
+    setChatSending(true);
+    setTimeout(() => flatListRef.current?.scrollToEnd({ animated: true }), 80);
+
+    try {
+      const res = await fetch(`${API_BASE_URL}/messages`, {
+        method: "POST",
+        headers: getHeaders(userTokenRef.current),
+        body: JSON.stringify({
+          receiverId: driverId,
+          text: msgText.trim(),
+          messageType,
+          routeId: assignedRoute?._id || null,
+        }),
+      });
+      const data = await res.json();
+      if (data.success && data.message) {
+        const real = data.message;
+        setChatMessages(prev => prev.map(m => m._id === tempId ? {
+          _id: real._id, text: real.text, fromDriver: false, fromMe: true,
+          isQuickReply: real.isQuickReply || false,
+          time: new Date(real.createdAt).toLocaleTimeString("en-US", { hour:"2-digit", minute:"2-digit" }),
+        } : m));
+      } else {
+        setChatMessages(prev => prev.filter(m => m._id !== tempId));
+        if (messageType === "typed") setTypedCount(prev => Math.max(0, prev - 1));
+        if (data.code === "TYPED_LIMIT_REACHED") {
+          Alert.alert("Limit Reached", "You have used all 3 typed messages. Use quick replies.");
         } else {
-          setChatMessages(prev => prev.filter(m => m._id !== tempMsg._id));
-          if (d.code === "DRIVER_NO_TYPING") Alert.alert("Not Allowed", "Quick replies only for passengers.");
-          else Alert.alert("Error", d.message || "Could not send.");
+          Alert.alert("Error", data.message || "Could not send message.");
         }
-      } catch {
-        setChatMessages(prev => prev.filter(m => m._id !== tempMsg._id));
-        Alert.alert("Error", "Network error.");
-      } finally { setChatSending(false); }
-    }, [chatOtherUser, chatSending, getHeaders, currentRoute]);
-
-    // ── pickupPassenger — THE SINGLE GATE to resume simulation ────────────────
-    //
-    // This is the ONLY function that unpauses the simulation.
-    // It does NOT wait for the passenger to tap "I'm On Board" first.
-    // The passenger hint (passengerConfirmedForStop) is informational only.
-    //
-    // Flow:
-    //   van arrives → pause → passenger may tap "I'm On Board" (shows ✅ hint)
-    //                       → driver MUST press "Confirm Pickup"
-    //                       → simulation resumes to next stop
-    //
-    const pickupPassenger = useCallback(async () => {
-      // Read from ref so we always get the latest stops, not stale closure data
-      const stops = routeStopsRef.current;
-      const stop = stops.find(s => s._id === waitingAtStop);
-      if (!stop || !currentRoute?._id) {
-        console.warn("[Driver] pickupPassenger: no matching stop or no route");
-        return;
       }
+    } catch {
+      setChatMessages(prev => prev.filter(m => m._id !== tempId));
+      if (messageType === "typed") setTypedCount(prev => Math.max(0, prev - 1));
+      Alert.alert("Error", "Network error. Could not send.");
+    } finally {
+      setChatSending(false);
+    }
+  };
 
-      const passengerId = stop.passengerId?.toString() || stop._id?.toString();
-      console.log(`[Driver] ✅ Confirming pickup: ${stop.passengerName} (${passengerId})`);
+  const getRouteStatusInfo = () => {
+    if (!assignedRoute) return { label:"No Route Assigned", color:"#999", icon:"information-circle-outline", bg:"#f5f5f5" };
+    const s = (assignedRoute.status || "").toLowerCase();
+    if (s === "assigned") return { label:"Route Assigned — Waiting to Start", color:"#5C35A0", icon:"time-outline", bg:"#EDE7F6" };
+    if (s === "in_progress") {
+      if (boarded || myPassengerEntry?.status === "picked") return { label:"You're On Board! 🎉", color:C.main, icon:"checkmark-circle", bg:C.light };
+      if (vanArrived || boardingPending) return { label:"Van Has Arrived! Board Now!", color:"#B91C1C", icon:"navigate", bg:"#FFEBEE" };
+      if (isNextPickup) return { label:"Van is Coming For You!", color:"#C62828", icon:"navigate", bg:"#FFEBEE" };
+      return { label:"Van En Route — Picking Up", color:C.info, icon:"car", bg:C.infoBg };
+    }
+    if (s === "completed") return { label:"Trip Completed ✅", color:C.main, icon:"checkmark-done-circle", bg:C.light };
+    return { label:"Scheduled", color:"#7A5C00", icon:"calendar-outline", bg:C.warnBg };
+  };
 
-      // 1. Persist to backend
-      try {
-        await fetch(
-          `${API_BASE_URL}/routes/${currentRoute._id}/stops/${stop._id}/status`,
-          { method: "PUT", headers: getHeaders(), body: JSON.stringify({ status: "picked" }) }
-        );
-      } catch (e) { console.warn("[Driver] pickupPassenger backend error:", e.message); }
+  // ── Map data (memoized) ────────────────────────────────────────────────────
+  const mapStops = useMemo(() => {
+    return (allPassengers || []).map((p, i) => ({
+      _id:           p._id?.toString() || `p-${i}`,
+      name:          p.pickupPoint || p.pickupAddress || `Stop ${i + 1}`,
+      passengerName: p.passengerName || "Passenger",
+      coordinate:    resolvePassengerCoord(p, i),
+      status:        p.status || "pending",
+      isMe:          (p.passengerId?.toString() || p._id?.toString()) === userIdRef.current,
+    }));
+  }, [allPassengers]);
 
-      // 2. Notify passenger's screen that driver confirmed
-      if (socketRef.current?.connected && activeTripIdRef.current) {
-        socketRef.current.emit("driverConfirmedPickup", {
-          tripId: activeTripIdRef.current,
-          routeId: currentRoute._id,
-          passengerId,
-          stopId: stop._id,
-          stopName: stop.name,
-        });
-      }
+  const dropStops = useMemo(() => {
+    return (allPassengers || []).map((p, i) => {
+      const coord = resolveDropCoord(p);
+      if (!coord) return null;
+      return {
+        key:          `drop-${i}`,
+        coordinate:   coord,
+        passengerName: p.passengerName || p.name || `Passenger ${i + 1}`,
+        destination:  resolveDestinationName(p),   // ← FIX: place name not passenger name
+        isMyDrop:     i === myStopIndex,
+      };
+    }).filter(Boolean);
+  }, [allPassengers, myStopIndex]);
 
-      // 3. Update local state
-      setRouteStops(prev => prev.map(s => {
-        const sid = s.passengerId?.toString() || s._id?.toString();
-        return sid === passengerId ? { ...s, status: "picked" } : s;
-      }));
-      setCompletedStops(prev => prev.includes(passengerId) ? prev : [...prev, passengerId]);
-      setCurrentStopIndex(prev => prev + 1);
+  // Polyline for map: prefer Google encoded polyline, else straight-line fallback
+  const mapPolylineCoords = useMemo(() => {
+    if (polylineCoords.length > 1) return polylineCoords;
+    const picks = mapStops.map(s => s.coordinate);
+    const drops = dropStops.map(d => d.coordinate);
+    return [...(vanPos ? [vanPos] : []), ...picks, ...drops];
+  }, [polylineCoords, mapStops, dropStops, vanPos]);
 
-      // 4. Clear waiting state
-      setWaitingAtStop(null);
-      setPassengerConfirmedForStop(null);
-      passengerConfirmedRef.current = null;
-      driverConfirmedRef.current = null;
+  // ── LIVE MAP ───────────────────────────────────────────────────────────────
+  const renderLiveMap = () => {
+    if (!assignedRoute || assignedRoute.status !== "in_progress") return null;
 
-      // ✅ CLEAR persisted pickup state — pickup is done
-      AsyncStorage.multiRemove([
-        PERSIST_WAITING_STOP,
-        PERSIST_WAITING_ROUTE,
-        PERSIST_PASSENGER_CONF,
-      ]).catch(() => { });
+    const vanCoord = vanPos || (mapStops.length > 0 ? mapStops[0].coordinate : null);
+    const allCoords = [
+      ...mapStops.map(s => s.coordinate),
+      ...dropStops.map(d => d.coordinate),
+      ...(vanCoord ? [vanCoord] : []),
+    ];
+    const initialRegion = vanCoord
+      ? { latitude:vanCoord.latitude, longitude:vanCoord.longitude, latitudeDelta:0.04, longitudeDelta:0.04 }
+      : fitRegion(allCoords);
 
-      // 5. Resume simulation — this is the ONLY place simPausedRef is set false
-      simPausedRef.current = false;
-      console.log(`[Driver] ▶ Simulation resuming → next stop`);
-    }, [waitingAtStop, currentRoute, getHeaders]);
-    // Note: routeStops intentionally NOT in deps — we read routeStopsRef.current instead
-
-    // ── isRideActive ───────────────────────────────────────────────────────────
-    const isRideActive = currentRoute
-      ? ["assigned", "in_progress", "active"].includes(currentRoute.status)
-      : false;
-
-    // ── Navigation ────────────────────────────────────────────────────────────
-    const handleLogout = () => {
-      setSidebarOpen(false);
-      setTimeout(() => {
-        Alert.alert("Logout", "Are you sure?", [
-          { text: "Cancel", style: "cancel" },
-          {
-            text: "Logout", style: "destructive", onPress: async () => {
-              socketRef.current?.disconnect();
-              await AsyncStorage.multiRemove(["authToken", "userId", "driverId", "userData"]);
-              navigation.reset({ index: 0, routes: [{ name: "Login" }] });
-            }
-          },
-        ]);
-      }, 300);
-    };
-
-    const navigateTo = (view) => {
-      setSidebarOpen(false);
-      if (view === "Messages") {
-        setTimeout(() => openChatWithTransporter(), 200);
-        return;
-      }
-      setTimeout(() => setCurrentView(view), 150);
-    };
-
-    const toggleSidebar = () => setSidebarOpen(prev => !prev);
-
-    // ── screenProps ───────────────────────────────────────────────────────────
-    const screenProps = {
-      loading, navigateTo, driverIdRef, authTokenRef, getHeaders,
-      dashboardStats, currentRoute, routeStarted, routeStops,
-      unreadNotifications: unreadCount, loadAllData,
-      available, activeAvailabilityRecord, startTime, setStartTime,
-      endTime, setEndTime, availabilityHistory, confirmAvailability,
-      markUnavailable: () => { },
-      completedStops, currentStopIndex, currentLocation,
-      stopDistances, waitingAtStop, onLocationTick: syncRouteLocation,
-      progress: routeStops.filter(s => s._isDriverOrigin !== true).length > 0 ? (completedStops.length / routeStops.filter(s => s._isDriverOrigin !== true).length) * 100 : 0,
-      completedCount: completedStops.length,
-      totalStops: routeStops.filter(s => s._isDriverOrigin !== true).length,
-      startRoute, completeRoute,
-      pickupPassenger,
-      passengerConfirmedForStop,
-      fetchAssignedRoutes,
-      filteredTrips: trips, search, setSearch, filter, setFilter,
-      paymentData, trips,
-      supportTickets, newTicketVisible, setNewTicketVisible,
-      ticketSubject, setTicketSubject, ticketDescription, setTicketDescription,
-      submitSupportTicket,
-      notifications, markNotificationRead,
-      openDriverChat,
-      isRideActive,
-      networkTransporter,
-      hideTransporterChat: true,
-    };
-
-    const isChatOpen = currentView === "Messages";
-
-    // ── Render ─────────────────────────────────────────────────────────────────
     return (
-      <View style={s.root}>
-        <StatusBar barStyle="light-content" backgroundColor={P.dark} />
-
-        {!isChatOpen && (
-          <LinearGradient colors={[P.main, P.dark]} start={{ x: 0, y: 0 }} end={{ x: 1, y: 0 }} style={s.appBar}>
-            <TouchableOpacity style={s.appBarBtn} onPress={toggleSidebar} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }} activeOpacity={0.75}>
-              <Ionicons name={sidebarOpen ? "close" : "menu"} size={24} color={P.white} />
-            </TouchableOpacity>
-
-            <View style={s.appBarCenter}>
-              <Text style={s.appBarTitle}>{SECTION_TITLES[currentView] || currentView}</Text>
-              <Text style={s.appBarSub} numberOfLines={1}>{driverProfile?.name || "Driver"}</Text>
+      <Animated.View style={{ transform:[{ translateY:cardTranslateY }], marginBottom:14 }}>
+        <View style={ds.card}>
+          <LinearGradient colors={[C.main, C.dark]} start={{ x:0,y:0 }} end={{ x:1,y:1 }} style={ds.cardHeader}>
+            <Icon name="map" size={18} color="#fff" />
+            <Text style={ds.cardHeaderTxt}>Live Van Location</Text>
+            <View style={ds.liveChip}>
+              <View style={ds.liveDot} />
+              <Text style={ds.liveTxt}>{useLiveTripLocation ? "GPS LIVE" : "SIM"}</Text>
             </View>
-
-            <TouchableOpacity style={s.appBarBtn} onPress={() => navigateTo("Notifications")} hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}>
-              <Ionicons name="notifications-outline" size={22} color={P.white} />
-              {unreadCount > 0 && (
-                <Animated.View style={[s.badge, { opacity: blinkAnim.interpolate({ inputRange: [0, 1], outputRange: [0.7, 1] }) }]}>
-                  <Text style={s.badgeTxt}>{unreadCount > 9 ? "9+" : unreadCount}</Text>
-                </Animated.View>
-              )}
-            </TouchableOpacity>
+            {encodedPolyline && (
+              <View style={[ds.liveChip, { backgroundColor:"rgba(37,99,235,0.3)", marginLeft:4 }]}>
+                <Icon name="navigate" size={9} color="#93C5FD" style={{ marginRight:3 }} />
+                <Text style={[ds.liveTxt, { color:"#93C5FD" }]}>ROUTE</Text>
+              </View>
+            )}
           </LinearGradient>
-        )}
 
-        <View style={{ flex: 1 }}>
-          {currentView === "Dashboard" && <DashboardScreen     {...screenProps} />}
-          {currentView === "Availability" && <AvailabilityScreen  {...screenProps} />}
-          {currentView === "Routes" && <RoutesScreen        {...screenProps} />}
-          {currentView === "History" && <HistoryScreen       {...screenProps} />}
-          {currentView === "Payments" && <PaymentsScreen      {...screenProps} />}
-          {currentView === "Support" && <SupportScreen       {...screenProps} />}
-          {currentView === "Notifications" && <NotificationsScreen {...screenProps} />}
-          {currentView === "Profile" && <DriverProfileScreen {...screenProps} />}
-          {currentView === "MonthlyFeedback" && (
-            <MonthlyFeedbackScreen
-              authTokenRef={authTokenRef}
-              getHeaders={getHeaders}
-              navigateTo={navigateTo}
-            />
-          )}
-          {currentView === "LeaveNetwork" && (
-            <LeaveNetworkScreen
-              driverProfile={driverProfile}
-              authTokenRef={authTokenRef}
-              getHeaders={getHeaders}
-              navigateTo={navigateTo}
-              navigation={navigation}
-            />
-          )}
-          {currentView === "DeleteAccount" && (
-            <DeleteAccountScreen
-              driverProfile={driverProfile}
-              authTokenRef={authTokenRef}
-              getHeaders={getHeaders}
-              navigateTo={navigateTo}
-              navigation={navigation}
-            />
-          )}
+          <View style={{ height:260, overflow:"hidden", borderBottomLeftRadius:16, borderBottomRightRadius:16 }}>
+            <MapView
+              ref={mapRef}
+              provider={PROVIDER_GOOGLE}
+              style={{ flex:1 }}
+              initialRegion={initialRegion}
+              showsUserLocation={false}
+              showsTraffic={false}
+              showsBuildings={true}
+              showsCompass={true}
+              mapType="standard"
+            >
+              {/* ── Route polyline — encoded (from driver) or straight-line fallback ── */}
+              {mapPolylineCoords.length > 1 && (
+                <Polyline
+                  coordinates={mapPolylineCoords}
+                  strokeColor={C.main}
+                  strokeWidth={encodedPolyline ? 4 : 5}
+                />
+              )}
 
-          {currentView === "Messages" && (
-            <DriverChatModal
-              personName={chatOtherUser?.name || ""}
-              personRole={chatOtherUser?.role || "passenger"}
-              messages={chatMessages}
-              onSend={handleDriverChatSend}
-              isRideActive={isRideActive}
-              onClose={closeDriverChat}
-              onOpenSidebar={() => setSidebarOpen(true)}
-            />
+              {/* ── Drop-off pins with DESTINATION NAME fix ── */}
+              {dropStops.map(drop => (
+                <Marker
+                  key={drop.key}
+                  coordinate={drop.coordinate}
+                  anchor={{ x:0.5, y:1 }}
+                  title={drop.destination}          // ← destination name (not passenger name)
+                  description={drop.passengerName}  // ← passenger name in description
+                  zIndex={drop.isMyDrop ? 15 : 2}
+                >
+                  <View style={{ alignItems:"center" }}>
+                    <View style={[ds.destPin, { backgroundColor: drop.isMyDrop ? "#DC2626" : "#EF4444" }]}>
+                      <Icon name="flag" size={14} color="#fff" />
+                    </View>
+                    {drop.isMyDrop && (
+                      <View style={{ backgroundColor:"#DC2626", paddingHorizontal:5, paddingVertical:2, borderRadius:4, marginTop:2 }}>
+                        <Text style={{ color:"#fff", fontSize:8, fontWeight:"900" }}>YOUR DROP</Text>
+                      </View>
+                    )}
+                  </View>
+                </Marker>
+              ))}
+
+              {/* ── Numbered stop markers for ALL passengers ── */}
+              {mapStops.map((st, i) => {
+                const isMyStop = i === myStopIndex;
+                const bg = isMyStop ? C.amber : stopBg(allPassengers[i]?.status || "pending");
+                return (
+                  <Marker
+                    key={st._id}
+                    coordinate={st.coordinate}
+                    anchor={{ x:0.5, y:0.5 }}
+                    title={st.passengerName}
+                    description={`Stop ${i + 1}: ${st.name}`}
+                    zIndex={isMyStop ? 10 : 1}
+                  >
+                    <View style={{ alignItems:"center" }}>
+                      {isMyStop ? (
+                        <View style={{ alignItems:"center" }}>
+                          <View style={{ backgroundColor:C.amber, paddingHorizontal:8, paddingVertical:4, borderRadius:8, borderWidth:2, borderColor:"#fff" }}>
+                            <Text style={{ color:"#fff", fontWeight:"900", fontSize:11 }}>YOU</Text>
+                          </View>
+                          <View style={{ width:0, height:0, borderLeftWidth:6, borderRightWidth:6, borderTopWidth:6, borderLeftColor:"transparent", borderRightColor:"transparent", borderTopColor:C.amber }} />
+                        </View>
+                      ) : (
+                        <View style={[ds.stopPin, { backgroundColor:bg }]}>
+                          <Text style={{ color:"#fff", fontWeight:"900", fontSize:10 }}>{i + 1}</Text>
+                        </View>
+                      )}
+                    </View>
+                  </Marker>
+                );
+              })}
+
+              {/* ── Smooth animated van marker ── */}
+              {vanCoord && (() => {
+                const animCoord = { latitude: latAnim, longitude: lngAnim };
+                return (
+                  <Marker.Animated
+                    coordinate={animCoord}
+                    anchor={{ x:0.5, y:0.5 }}
+                    title="Van"
+                    description={driverInfo.name}
+                    zIndex={20}
+                  >
+                    <Animated.View style={{ transform:[{ scale:vanPulse }] }}>
+                      <View style={ds.vanMarker}>
+                        <Icon name="bus" size={18} color="#fff" />
+                      </View>
+                    </Animated.View>
+                  </Marker.Animated>
+                );
+              })()}
+            </MapView>
+          </View>
+
+          {/* ETA bar */}
+          <View style={ds.etaBar}>
+            <Icon name="hourglass-outline" size={15} color={etaToMe && etaToMe <= 10 ? "#EF4444" : C.amber} />
+            <Text style={[ds.etaBarTxt, etaToMe && etaToMe <= 10 && { color:"#EF4444", fontWeight:"800" }]}>
+              {(boarded || myPassengerEntry?.status === "picked")
+                ? "✅ You're on board!"
+                : (vanArrived || boardingPending)
+                ? "🚐 Van is HERE — Board Now!"
+                : etaToMe
+                ? `Van arrives at your stop in ~${etaToMe} min${etaToMe <= 10 ? " ⚠️" : ""}`
+                : "Calculating your ETA…"}
+            </Text>
+          </View>
+
+          {/* Board button — appears when van has arrived and passenger hasn't confirmed yet */}
+          {(boardingPending && !boarded && myPassengerEntry?.status !== "picked") && (
+            <Animated.View style={{ transform:[{ scale:boardingPulse }] }}>
+              <TouchableOpacity
+                style={{ backgroundColor:C.main, margin:12, borderRadius:14, paddingVertical:14, alignItems:"center", flexDirection:"row", justifyContent:"center", gap:8 }}
+                onPress={handlePassengerConfirmBoarding}
+                disabled={confirmingBoarding}
+              >
+                {confirmingBoarding
+                  ? <ActivityIndicator size="small" color="#fff" />
+                  : <>
+                      <Icon name="checkmark-circle" size={22} color="#fff" />
+                      <Text style={{ color:"#fff", fontWeight:"900", fontSize:16 }}>I'm On Board! ✅</Text>
+                    </>
+                }
+              </TouchableOpacity>
+            </Animated.View>
           )}
         </View>
+      </Animated.View>
+    );
+  };
 
-        {sidebarOpen && (
-          <TouchableOpacity style={s.overlay} activeOpacity={1} onPress={() => setSidebarOpen(false)} />
-        )}
+  // ── Active route banner ────────────────────────────────────────────────────
+  const renderActiveRouteBanner = () => {
+    if (!assignedRoute || assignedRoute.status !== "in_progress") return null;
+    if (boarded || myPassengerEntry?.status === "picked") return null;
 
-        <Animated.View style={[s.sidebar, { transform: [{ translateX: slideAnim }] }]}>
-          <LinearGradient colors={[P.main, P.dark]} style={s.sidebarHeader}>
-            <View style={s.sidebarHeaderRow}>
-              <TouchableOpacity style={s.sidebarProfileTap} onPress={() => navigateTo("Profile")} activeOpacity={0.75}>
-                <View style={s.sidebarAvatar}>
-                  <Text style={s.sidebarAvatarTxt}>{initials(driverProfile?.name)}</Text>
+    // Show GOING_TO_DESTINATION banner if applicable
+    if (rideState === "GOING_TO_DESTINATION") {
+      return (
+        <View style={ds.goingDestBanner}>
+          <Icon name="navigate" size={18} color="#fff" />
+          <View style={{ flex:1, marginLeft:10 }}>
+            <Text style={ds.goingDestTitle}>All passengers on board!</Text>
+            <Text style={ds.goingDestSub}>Heading to {finalDestName || "final destination"}…</Text>
+          </View>
+        </View>
+      );
+    }
+
+    const isUrgent = vanArrived || boardingPending || isNextPickup;
+    return (
+      <Animated.View style={{ transform:[{ scale:nextPickupPulse }], marginHorizontal:16, marginBottom:10 }}>
+        <LinearGradient
+          colors={isUrgent ? ["#3A1A1A","#5A2020"] : [C.dark, C.deeper]}
+          start={{ x:0,y:0 }} end={{ x:1,y:1 }}
+          style={ds.activeBanner}
+        >
+          <View style={[ds.activeBannerIcon, { backgroundColor: isUrgent ? "rgba(232,120,120,0.2)" : "rgba(126,200,127,0.15)" }]}>
+            <Animated.View style={{ transform:[{ scale:pulseAnim }] }}>
+              <Icon name={isUrgent ? "navigate" : "car"} size={28} color={isUrgent ? C.urgentAccent : C.pollAccent} />
+            </Animated.View>
+          </View>
+          <View style={{ flex:1, marginLeft:14 }}>
+            <Text style={[ds.activeBannerTitle, { color: isUrgent ? C.urgentAccent : C.pollAccent }]}>
+              {(vanArrived || boardingPending) ? "🚐 Van is HERE!" : isNextPickup ? "🚨 Van is Coming For You!" : "🚐 Van is En Route"}
+            </Text>
+            <Text style={ds.activeBannerSub}>
+              {(vanArrived || boardingPending) ? "Board the van now!" : isNextPickup ? "Get ready at your stop!" : `${pickedBeforeMe} of ${totalPassengers} picked up`}
+            </Text>
+            {etaToMe && !(vanArrived || boardingPending) && (
+              <View style={ds.etaPill}>
+                <Icon name="hourglass-outline" size={11} color={etaToMe <= 10 ? "#EF4444" : C.warn} />
+                <Text style={[ds.etaPillTxt, etaToMe <= 10 && { color:"#EF4444" }]}>ETA: ~{etaToMe} min{etaToMe <= 10 ? " ⚠️" : ""}</Text>
+              </View>
+            )}
+          </View>
+        </LinearGradient>
+      </Animated.View>
+    );
+  };
+
+  // ── Route status card ──────────────────────────────────────────────────────
+  const renderRouteStatusCard = () => {
+    const si = getRouteStatusInfo();
+    return (
+      <Animated.View style={{ transform:[{ translateY:cardTranslateY }], marginBottom:14 }}>
+        <View style={ds.card}>
+          <LinearGradient colors={[C.main, C.dark]} start={{ x:0,y:0 }} end={{ x:1,y:1 }} style={ds.cardHeader}>
+            <Icon name="car" size={18} color="#fff" />
+            <Text style={ds.cardHeaderTxt}>Today's Route</Text>
+            {assignedRoute?.status === "in_progress" && (
+              <View style={ds.liveChip}><View style={ds.liveDot} /><Text style={ds.liveTxt}>LIVE</Text></View>
+            )}
+          </LinearGradient>
+          {assignedRoute ? (
+            <View style={ds.cardBody}>
+              <View style={[ds.statusPill, { backgroundColor:si.bg }]}>
+                <Icon name={si.icon} size={14} color={si.color} />
+                <Text style={[ds.statusPillTxt, { color:si.color }]}>{si.label}</Text>
+              </View>
+              <Text style={ds.routeName}>{assignedRoute.routeName || assignedRoute.name || "Route"}</Text>
+              <View style={ds.infoGrid}>
+                <View style={ds.infoItem}><Icon name="time-outline" size={15} color={C.main} /><Text style={ds.infoLabel}>Pickup</Text><Text style={ds.infoValue}>{assignedRoute.pickupTime || assignedRoute.timeSlot || "N/A"}</Text></View>
+                <View style={ds.infoItem}><Icon name="people-outline" size={15} color={C.main} /><Text style={ds.infoLabel}>Passengers</Text><Text style={ds.infoValue}>{totalPassengers}</Text></View>
+                {assignedRoute.estimatedKm && <View style={ds.infoItem}><Icon name="map-outline" size={15} color={C.main} /><Text style={ds.infoLabel}>Distance</Text><Text style={ds.infoValue}>{assignedRoute.estimatedKm}</Text></View>}
+                {pickedBeforeMe > 0 && <View style={ds.infoItem}><Icon name="checkmark-done-outline" size={15} color={C.success} /><Text style={ds.infoLabel}>Picked</Text><Text style={[ds.infoValue, { color:C.success }]}>{pickedBeforeMe}/{totalPassengers}</Text></View>}
+              </View>
+              {(myPassengerEntry?.pickupPoint || myPassengerEntry?.pickupAddress) && (
+                <View style={ds.pickupRow}>
+                  <Icon name="location" size={15} color={C.amber} />
+                  <Text style={ds.pickupLabel}>My Stop:</Text>
+                  <Text style={ds.pickupValue} numberOfLines={1}>{myPassengerEntry.pickupPoint || myPassengerEntry.pickupAddress}</Text>
                 </View>
-                <View style={{ flex: 1, marginLeft: 14 }}>
-                  <Text style={s.sidebarName} numberOfLines={1}>{driverProfile?.name || "Driver"}</Text>
-                  <Text style={s.sidebarPhone} numberOfLines={1}>{driverProfile?.phone || "Driver App"}</Text>
-                  <View style={s.activePill}>
-                    <View style={[s.activeDot, { backgroundColor: available ? "#69F0AE" : P.border }]} />
-                    <Text style={s.activeTxt}>{available ? "Available" : "Unavailable"}</Text>
-                  </View>
+              )}
+              {assignedRoute.destination && (
+                <View style={[ds.pickupRow, { backgroundColor:"#FEE2E2" }]}>
+                  <Icon name="flag-outline" size={15} color="#DC2626" />
+                  <Text style={[ds.pickupLabel, { color:"#DC2626" }]}>Destination:</Text>
+                  <Text style={[ds.pickupValue, { color:"#DC2626" }]} numberOfLines={1}>{assignedRoute.destination}</Text>
                 </View>
-                <Ionicons name="chevron-forward" size={16} color="rgba(172,197,168,0.7)" style={{ marginRight: 36 }} />
-              </TouchableOpacity>
-              <TouchableOpacity style={s.sidebarCloseBtn} onPress={() => setSidebarOpen(false)}>
-                <Ionicons name="close" size={20} color={P.white} />
-              </TouchableOpacity>
+              )}
+              {(boarded || myPassengerEntry?.status === "picked") && (
+                <View style={[ds.statusRow, { backgroundColor:C.light }]}>
+                  <Icon name="checkmark-circle" size={17} color={C.main} />
+                  <Text style={[ds.statusRowTxt, { color:C.main }]}>You're on board ✅</Text>
+                </View>
+              )}
+              {/* Board button in route card (manual fallback) */}
+              {(vanArrived || boardingPending) && !boarded && myPassengerEntry?.status !== "picked" && (
+                <Animated.View style={{ transform:[{ scale:boardingPulse }] }}>
+                  <TouchableOpacity
+                    style={{ backgroundColor:C.main, borderRadius:12, paddingVertical:13, alignItems:"center", flexDirection:"row", justifyContent:"center", gap:8, marginTop:10 }}
+                    onPress={handlePassengerConfirmBoarding}
+                    disabled={confirmingBoarding}
+                  >
+                    {confirmingBoarding
+                      ? <ActivityIndicator size="small" color="#fff" />
+                      : <><Icon name="checkmark-circle" size={20} color="#fff" /><Text style={{ color:"#fff", fontWeight:"900", fontSize:15 }}>I'm On Board!</Text></>
+                    }
+                  </TouchableOpacity>
+                </Animated.View>
+              )}
             </View>
-            <Text style={s.profileHint}>Tap to view profile</Text>
+          ) : (
+            <View style={ds.cardBody}>
+              <View style={[ds.statusPill, { backgroundColor:"#f5f5f5" }]}>
+                <Icon name="information-circle-outline" size={14} color="#999" />
+                <Text style={[ds.statusPillTxt, { color:"#999" }]}>No route assigned for today</Text>
+              </View>
+              <Text style={ds.noRouteTxt}>Your transporter hasn't assigned a route yet.</Text>
+            </View>
+          )}
+        </View>
+      </Animated.View>
+    );
+  };
+
+  // ── Driver & Route Info Card ───────────────────────────────────────────────
+  const renderDriverCard = () => {
+    const hasDriver = assignedRoute && routeDriver;
+    const myPickup  = myPassengerEntry?.pickupPoint || myPassengerEntry?.pickupAddress || assignedRoute?.pickupPoint || "—";
+    const myDropoff = resolveDestinationName(myPassengerEntry || assignedRoute || {});
+
+    return (
+      <Animated.View style={{ transform:[{ translateY:cardTranslateY }], marginBottom:14 }}>
+        <View style={ds.card}>
+          {/* ── Card Header ── */}
+          <LinearGradient colors={[C.main, C.dark]} start={{ x:0,y:0 }} end={{ x:1,y:1 }} style={ds.cardHeader}>
+            <Icon name="person" size={18} color="#fff" />
+            <Text style={ds.cardHeaderTxt}>Your Driver & Trip Info</Text>
+            {hasDriver && (
+              <View style={[ds.liveChip, { backgroundColor:"rgba(165,214,167,0.2)" }]}>
+                <View style={[ds.liveDot, { backgroundColor:"#A5D6A7" }]} />
+                <Text style={[ds.liveTxt, { color:"#A5D6A7" }]}>
+                  {assignedRoute.status === "in_progress" ? "ACTIVE" : "ASSIGNED"}
+                </Text>
+              </View>
+            )}
           </LinearGradient>
 
-          <ScrollView style={s.sidebarScroll} showsVerticalScrollIndicator={false}>
-            <Text style={s.menuSectionLabel}>MAIN MENU</Text>
-            {MENU.map(item => {
-              const active = item.view !== "Messages" && currentView === item.view;
-              const badge = item.view === "Notifications" ? unreadCount
-                : item.view === "Messages" ? unreadMsgCount
-                  : 0;
-              return (
-                <TouchableOpacity
-                  key={item.view}
-                  style={[s.menuItem, active && s.menuItemActive]}
-                  onPress={() => navigateTo(item.view)}
-                  activeOpacity={0.75}
-                >
-                  {active && <View style={s.menuAccent} />}
-                  <View style={[s.menuIconBox, active && s.menuIconBoxActive]}>
-                    <Ionicons name={active ? item.activeIcon : item.icon} size={18} color={active ? P.white : P.textLight} />
+          {/* ── Driver assignment status ── */}
+          {hasDriver ? (
+            <>
+              {/* Driver Info Row */}
+              <View style={ds.driverBox}>
+                <LinearGradient colors={[C.main, C.dark]} style={ds.driverAvatar}>
+                  <Text style={ds.driverAvatarTxt}>{getInitials(driverInfo.name)}</Text>
+                </LinearGradient>
+                <View style={{ flex:1, marginLeft:14 }}>
+                  <Text style={ds.driverName}>{driverInfo.name}</Text>
+                  <Text style={{ fontSize:11, color:"#888", marginBottom:3 }}>
+                    ID: {routeDriver._id?.toString().slice(-6).toUpperCase() || "—"}
+                  </Text>
+                  <View style={ds.ratingRow}>
+                    {[1,2,3,4,5].map(star => (
+                      <Icon key={star} name={star <= Math.round(driverInfo.rating) ? "star" : "star-outline"} size={13} color="#FFD700" />
+                    ))}
+                    <Text style={ds.ratingTxt}> {driverInfo.rating}</Text>
                   </View>
-                  <Text style={[s.menuItemTxt, active && s.menuItemTxtActive]}>{item.label}</Text>
-                  {badge > 0 && (
-                    <View style={s.menuBadge}>
-                      <Text style={s.menuBadgeTxt}>{badge > 9 ? "9+" : badge}</Text>
-                    </View>
+                  <View style={ds.vehicleRow}>
+                    <Icon name="car-sport-outline" size={13} color="#666" />
+                    <Text style={ds.vehicleTxt}>{driverInfo.vehicleModel}</Text>
+                    {driverInfo.vehicleNumber !== "N/A" && (
+                      <View style={ds.plateBadge}>
+                        <Text style={ds.plateTxt}>{driverInfo.vehicleNumber}</Text>
+                      </View>
+                    )}
+                  </View>
+                </View>
+                {/* Chat button — shown only during active ride */}
+                <View style={ds.driverActions}>
+                  {assignedRoute?.status === "in_progress" && (
+                    <TouchableOpacity
+                      style={[ds.actionBtn, { position:"relative" }]}
+                      onPress={openChatWithDriver}
+                    >
+                      <Icon name="chatbubble-ellipses" size={19} color={C.main} />
+                      {unreadChatCount > 0 && (
+                        <View style={ds.chatRedDot}>
+                          <Text style={ds.chatRedDotTxt}>
+                            {unreadChatCount > 9 ? "9+" : unreadChatCount}
+                          </Text>
+                        </View>
+                      )}
+                    </TouchableOpacity>
                   )}
-                </TouchableOpacity>
-              );
-            })}
-
-            <View style={s.menuDivider} />
-
-            
-
-            {/* Leave Transporter Network — navigates to dedicated screen */}
-            <TouchableOpacity
-              style={s.menuItem}
-              onPress={() => navigateTo("LeaveNetwork")}
-              activeOpacity={0.75}
-            >
-              <View style={[s.menuIconBox, { backgroundColor: '#FFF3E0' }]}>
-                <Ionicons name="exit-outline" size={18} color="#E65100" />
+                </View>
               </View>
-              <Text style={[s.menuItemTxt, { color: '#E65100' }]}>Leave Transporter Network</Text>
-              <Ionicons name="chevron-forward" size={14} color="#E6510080" />
-            </TouchableOpacity>
 
-            {/* Delete Account Permanently — navigates to dedicated screen */}
-            <TouchableOpacity
-              style={s.menuItem}
-              onPress={() => navigateTo("DeleteAccount")}
-              activeOpacity={0.75}
-            >
-              <View style={[s.menuIconBox, { backgroundColor: '#FFEBEE' }]}>
-                <Ionicons name="trash-outline" size={18} color={P.main} />
+              {/* ── Pickup / Drop-off info card ── */}
+              <View style={{ paddingHorizontal:14, paddingBottom:12 }}>
+                {/* Pickup location row */}
+                <View style={ds.tripInfoRow}>
+                  <View style={[ds.tripDot, { backgroundColor: C.amber }]} />
+                  <View style={{ flex:1 }}>
+                    <Text style={ds.tripInfoLabel}>Pickup Location</Text>
+                    <Text style={ds.tripInfoValue} numberOfLines={2}>{myPickup}</Text>
+                  </View>
+                  <Icon name="location" size={16} color={C.amber} />
+                </View>
+
+                {/* Connector line */}
+                <View style={{ marginLeft:6, width:2, height:12, backgroundColor:"#E0E0E0", marginVertical:2 }} />
+
+                {/* Drop-off location row — highlighted */}
+                <View style={[ds.tripInfoRow, { backgroundColor:"#FEE2E2", borderRadius:10, borderWidth:1, borderColor:"#FECACA" }]}>
+                  <View style={[ds.tripDot, { backgroundColor:"#DC2626" }]} />
+                  <View style={{ flex:1 }}>
+                    <Text style={[ds.tripInfoLabel, { color:"#991B1B" }]}>Drop-off Location</Text>
+                    <Text style={[ds.tripInfoValue, { color:"#DC2626", fontWeight:"800" }]} numberOfLines={2}>{myDropoff}</Text>
+                  </View>
+                  <Icon name="flag" size={16} color="#DC2626" />
+                </View>
               </View>
-              <Text style={[s.menuItemTxt, { color: P.main }]}>Delete Account Permanently</Text>
-              <Ionicons name="chevron-forward" size={14} color={P.main + '80'} />
-            </TouchableOpacity>
 
-            <View style={s.menuDivider} />
-            <TouchableOpacity style={s.menuItem} onPress={handleLogout} activeOpacity={0.75}>
-              <View style={[s.menuIconBox, { backgroundColor: "#FFEBEE" }]}>
-                <Ionicons name="log-out-outline" size={18} color={P.error} />
+              {/* Status chips bar */}
+              <View style={ds.routeInfoBar}>
+                <View style={ds.routeInfoChip}>
+                  <Icon name="time-outline" size={13} color={C.main} />
+                  <Text style={ds.routeInfoTxt}>{assignedRoute.pickupTime || assignedRoute.timeSlot || "N/A"}</Text>
+                </View>
+                {assignedRoute.vehicleType && (
+                  <View style={ds.routeInfoChip}>
+                    <Icon name="bus-outline" size={13} color={C.main} />
+                    <Text style={ds.routeInfoTxt}>{assignedRoute.vehicleType}</Text>
+                  </View>
+                )}
+                <View style={[ds.routeInfoChip, { backgroundColor: assignedRoute.status === "in_progress" ? C.light : C.warnBg }]}>
+                  <View style={[ds.liveDot, { backgroundColor: assignedRoute.status === "in_progress" ? C.main : C.amber, width:6, height:6 }]} />
+                  <Text style={[ds.routeInfoTxt, { color: assignedRoute.status === "in_progress" ? C.main : "#7A5C00", fontWeight:"700" }]}>
+                    {assignedRoute.status === "in_progress" ? "Active" : "Scheduled"}
+                  </Text>
+                </View>
               </View>
-              <Text style={[s.menuItemTxt, { color: P.error, fontWeight: "700" }]}>Logout</Text>
-            </TouchableOpacity>
-            <View style={{ height: 40 }} />
-          </ScrollView>
-        </Animated.View>
+            </>
+          ) : (
+            <View style={ds.cardBody}>
+              {/* ── "No Driver Assigned" with clear status ── */}
+              <View style={{ alignItems:"center", paddingVertical:10 }}>
+                <View style={{ width:52, height:52, borderRadius:26, backgroundColor:"#F3F4F6", alignItems:"center", justifyContent:"center", marginBottom:10 }}>
+                  <Icon name="person-outline" size={26} color="#9CA3AF" />
+                </View>
+                <Text style={{ fontSize:15, fontWeight:"800", color:"#374151", marginBottom:4 }}>
+                  {assignedRoute ? "No Driver Assigned Yet" : "No Route Assigned"}
+                </Text>
+                <Text style={ds.noRouteTxt}>
+                  {assignedRoute
+                    ? "Your transporter is in the process of assigning a driver to your route."
+                    : "Your transporter hasn't assigned a route yet. Check back soon."}
+                </Text>
+                {assignedRoute && (
+                  <View style={[ds.statusPill, { backgroundColor:"#FEF3C7", marginTop:10, alignSelf:"center" }]}>
+                    <Icon name="time-outline" size={13} color="#B45309" />
+                    <Text style={[ds.statusPillTxt, { color:"#B45309" }]}>Pending Driver Assignment</Text>
+                  </View>
+                )}
+              </View>
+            </View>
+          )}
+        </View>
+      </Animated.View>
+    );
+  };
 
-        {loading && (
-          <View style={s.loaderOverlay}>
-            <View style={s.loaderBox}>
-              <ActivityIndicator size="large" color={P.main} />
-              <Text style={s.loaderTxt}>Loading…</Text>
+  // ── RENDER ─────────────────────────────────────────────────────────────────
+  return (
+    <View style={ds.container}>
+      <LinearGradient colors={[C.main, C.dark]} start={{ x:0,y:0 }} end={{ x:1,y:0 }} style={ds.header}>
+        <TouchableOpacity onPress={() => navigation.openDrawer()}>
+          <Icon name="menu" size={27} color="#fff" />
+        </TouchableOpacity>
+        <Text style={ds.headerTitle}>Dashboard</Text>
+        <TouchableOpacity style={ds.notifWrap} onPress={() => navigation.navigate("Notifications")}>
+          <Icon name="notifications" size={25} color="#fff" />
+          {(unreadCount > 0 || showPollModal || showMorningConf || isNextPickup || vanArrived || boardingPending) && (
+            <Animated.View style={[ds.blinkDot, { opacity:blinkOpacity }]} />
+          )}
+          {unreadCount > 0 && (
+            <View style={ds.badge}>
+              <Text style={ds.badgeTxt}>{unreadCount > 9 ? "9+" : unreadCount}</Text>
+            </View>
+          )}
+        </TouchableOpacity>
+      </LinearGradient>
+
+      <ScrollView
+        contentContainerStyle={ds.scroll}
+        showsVerticalScrollIndicator={false}
+        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} colors={[C.main]} tintColor={C.main} />}
+      >
+        <View style={{ height:14 }} />
+
+        {/* ── BOARDING: Pending Confirmation (after passenger said YES) ── */}
+        {passengerSaidYes && !boarded && (
+          <View style={[ds.boardingBanner, { backgroundColor:"#1D4ED8", flexDirection:"column", alignItems:"stretch" }]}>
+            <View style={{ flexDirection:"row", alignItems:"center", marginBottom:10 }}>
+              <View style={ds.boardingIconWrap}>
+                <ActivityIndicator size="small" color="#fff" />
+              </View>
+              <View style={{ flex:1, marginLeft:12 }}>
+                <Text style={ds.boardingBannerTitle}>⏳ Pending Confirmation</Text>
+                <Text style={ds.boardingBannerSub}>Waiting for driver to confirm your boarding…</Text>
+              </View>
+            </View>
+            <View style={{ backgroundColor:"rgba(255,255,255,0.15)", borderRadius:10, padding:10 }}>
+              <Text style={{ color:"rgba(255,255,255,0.9)", fontSize:12, textAlign:"center" }}>
+                Your "I'm on board" signal has been sent to the driver. The ride will start once the driver confirms.
+              </Text>
             </View>
           </View>
         )}
 
+        {/* ── BOARDING: YES / NO confirmation banner (van has arrived) ── */}
+        {boardingPending && !boarded && !passengerSaidYes && (
+          <Animated.View style={[ds.boardingBanner, { transform:[{ scale:boardingPulse }], flexDirection:"column", alignItems:"stretch" }]}>
+            <View style={{ flexDirection:"row", alignItems:"center", marginBottom:12 }}>
+              <View style={ds.boardingIconWrap}>
+                <Icon name="bus" size={24} color="#fff" />
+              </View>
+              <View style={{ flex:1, marginLeft:12 }}>
+                <Text style={ds.boardingBannerTitle}>🚐 Van has arrived at your stop!</Text>
+                <Text style={ds.boardingBannerSub}>
+                  {boardingStopName ? `📍 ${boardingStopName}` : "Are you boarding the van?"}
+                </Text>
+              </View>
+            </View>
+            <View style={{ flexDirection:"row", gap:10 }}>
+              <TouchableOpacity
+                style={{ flex:1, backgroundColor:"#415844", borderRadius:12, paddingVertical:13, alignItems:"center", flexDirection:"row", justifyContent:"center", gap:8 }}
+                onPress={handlePassengerConfirmBoarding}
+                disabled={confirmingBoarding}
+                activeOpacity={0.85}
+              >
+                {confirmingBoarding
+                  ? <ActivityIndicator size="small" color="#fff" />
+                  : <><Icon name="checkmark-circle" size={20} color="#fff" /><Text style={{ color:"#fff", fontWeight:"900", fontSize:15 }}>YES, I'm On Board</Text></>
+                }
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={{ flex:1, backgroundColor:"rgba(220,38,38,0.85)", borderRadius:12, paddingVertical:13, alignItems:"center", flexDirection:"row", justifyContent:"center", gap:8, borderWidth:1.5, borderColor:"rgba(255,255,255,0.5)" }}
+                onPress={() => {
+                  // Saying NO means not going today — penalty applies.
+                  // Opens the Not Going modal so the penalty is shown before confirming.
+                  setShowNotGoingModal(true);
+                }}
+                disabled={confirmingBoarding}
+                activeOpacity={0.85}
+              >
+                <Icon name="close-circle" size={20} color="#fff" />
+                <Text style={{ color:"#fff", fontWeight:"900", fontSize:15 }}>NO, I'm Not Going</Text>
+              </TouchableOpacity>
+            </View>
 
-      </View>
-    );
-  }
+            {/* ── I'm Not Going Button ── */}
+            {!notGoingDone && (
+              <TouchableOpacity
+                style={{ marginTop:10, backgroundColor:"#DC2626", borderRadius:12, paddingVertical:12, alignItems:"center", flexDirection:"row", justifyContent:"center", gap:8 }}
+                onPress={() => setShowNotGoingModal(true)}
+                activeOpacity={0.85}
+              >
+                <Icon name="close-circle" size={20} color="#fff" />
+                <Text style={{ color:"#fff", fontWeight:"900", fontSize:15 }}>I'm NOT Going Today 🚫</Text>
+              </TouchableOpacity>
+            )}
+            {notGoingDone && (
+              <View style={{ marginTop:10, backgroundColor:"rgba(220,38,38,0.25)", borderRadius:12, paddingVertical:12, alignItems:"center", flexDirection:"row", justifyContent:"center", gap:8 }}>
+                <Icon name="close-circle" size={20} color="#fca5a5" />
+                <Text style={{ color:"#fca5a5", fontWeight:"900", fontSize:15 }}>Marked as Not Going ✓</Text>
+              </View>
+            )}
+          </Animated.View>
+        )}
 
-  const s = StyleSheet.create({
-    root: { flex: 1, backgroundColor: P.bg },
+        {/* ── GOING TO DESTINATION banner ── */}
+        {rideState === "GOING_TO_DESTINATION" && (
+          <View style={ds.goingDestBanner}>
+            <Icon name="navigate" size={18} color="#fff" />
+            <View style={{ flex:1, marginLeft:10 }}>
+              <Text style={ds.goingDestTitle}>All passengers on board!</Text>
+              <Text style={ds.goingDestSub}>Heading to {finalDestName || "final destination"}…</Text>
+            </View>
+          </View>
+        )}
 
-    appBar: { flexDirection: "row", alignItems: "center", paddingHorizontal: 14, paddingTop: STATUS_BAR_H + 10, paddingBottom: 10, elevation: 6, shadowColor: P.dark, shadowOpacity: 0.22, shadowRadius: 8, shadowOffset: { width: 0, height: 3 } },
-    appBarBtn: { width: 40, height: 40, borderRadius: 12, backgroundColor: "rgba(255,255,255,0.15)", alignItems: "center", justifyContent: "center", position: "relative" },
-    appBarCenter: { flex: 1, alignItems: "center" },
-    appBarTitle: { fontSize: 17, fontWeight: "800", color: P.white, letterSpacing: 0.3 },
-    appBarSub: { fontSize: 11, color: "rgba(255,255,255,0.65)", marginTop: 1 },
+        {/* ── TRIP COMPLETED banner ── */}
+        {tripCompleted && (
+          <View style={[ds.boardingBanner, { backgroundColor:"#1A2B1C" }]}>
+            <Icon name="flag" size={22} color="#fff" />
+            <Text style={[ds.boardingBannerTitle, { marginLeft:10, flex:1 }]}>Trip completed! You have arrived. 🎉</Text>
+          </View>
+        )}
 
-    badge: { position: "absolute", top: -2, right: -2, backgroundColor: P.error, borderRadius: 9, minWidth: 18, height: 18, alignItems: "center", justifyContent: "center", paddingHorizontal: 3, borderWidth: 1.5, borderColor: P.white },
-    badgeTxt: { fontSize: 9, color: P.white, fontWeight: "900" },
+        {/* Poll alert */}
+        {showPollModal && selectedPoll && (
+          <Animated.View style={{ opacity:fadeAnim, transform:[{ translateY:pollSlideAnim },{ scale:pollPulseAnim }], marginTop:16, marginBottom:4 }}>
+            <LinearGradient colors={["#415844","#7b807b"]} start={{ x:0,y:0 }} end={{ x:1,y:1 }} style={ds.alertBox}>
+              <Animated.View style={{ transform:[{ scale:pulseAnim }] }}>
+                <Icon name="help-circle" size={26} color="#fff" />
+              </Animated.View>
+              <View style={{ flex:1, marginLeft:12 }}>
+                <Text style={ds.alertTitle}>{selectedPoll.title}</Text>
+                <Text style={ds.alertText}>{selectedPoll.question || "Will you travel tomorrow?"}</Text>
+                <View style={ds.alertBtns}>
+                  <TouchableOpacity style={[ds.confirmBtn, { opacity:loadingResponse ? 0.65 : 1 }]} onPress={() => submitPollResponse("yes")} disabled={!!loadingResponse} activeOpacity={0.8}>
+                    {loadingResponse === "yes" ? <ActivityIndicator size="small" color="#fff" /> : <><Icon name="checkmark-circle" size={16} color="#fff" /><Text style={ds.btnText}>Yes, I'll Travel</Text></>}
+                  </TouchableOpacity>
+                  <TouchableOpacity style={[ds.cancelBtn, { opacity:loadingResponse ? 0.65 : 1 }]} onPress={() => submitPollResponse("no")} disabled={!!loadingResponse} activeOpacity={0.8}>
+                    {loadingResponse === "no" ? <ActivityIndicator size="small" color="#fff" /> : <><Icon name="close-circle" size={16} color="#fff" /><Text style={ds.btnText}>No</Text></>}
+                  </TouchableOpacity>
+                </View>
+              </View>
+            </LinearGradient>
+          </Animated.View>
+        )}
 
-    overlay: { position: "absolute", left: 0, top: 0, right: 0, bottom: 0, backgroundColor: "rgba(0,0,0,0.42)", zIndex: 99 },
-    sidebar: { position: "absolute", left: 0, top: 0, bottom: 0, width: 300, backgroundColor: P.white, zIndex: 100, elevation: 20, shadowColor: "#000", shadowOffset: { width: 2, height: 0 }, shadowOpacity: 0.18, shadowRadius: 10 },
+        {/* Morning confirmation */}
+        {showMorningConf && morningTrip && (
+          <Animated.View style={{ opacity:fadeAnim, transform:[{ translateY:morningSlideAnim },{ scale:morningPulseAnim }], marginTop:showPollModal ? 8 : 16, marginBottom:4 }}>
+            <LinearGradient colors={["#415844","#7b807b"]} start={{ x:0,y:0 }} end={{ x:1,y:1 }} style={ds.alertBox}>
+              <Animated.View style={{ transform:[{ scale:pulseAnim }] }}>
+                <Icon name="bus" size={26} color="#fff" />
+              </Animated.View>
+              <View style={{ flex:1, marginLeft:12 }}>
+                <Text style={ds.alertTitle}>Final Confirmation</Text>
+                <Text style={ds.alertText}>Are you still traveling today? Van will start soon!</Text>
+                <View style={ds.alertBtns}>
+                  <TouchableOpacity style={ds.confirmBtn} onPress={() => submitMorningConf(true)} disabled={loading}>
+                    {loading ? <ActivityIndicator size="small" color="#fff" /> : <><Icon name="checkmark-circle" size={16} color="#fff" /><Text style={ds.btnText}>Yes, Traveling</Text></>}
+                  </TouchableOpacity>
+                  <TouchableOpacity style={ds.cancelBtn} onPress={() => submitMorningConf(false)} disabled={loading}>
+                    <Icon name="close-circle" size={16} color="#fff" /><Text style={ds.btnText}>No</Text>
+                  </TouchableOpacity>
+                </View>
+              </View>
+            </LinearGradient>
+          </Animated.View>
+        )}
 
-    sidebarHeader: { paddingHorizontal: 20, paddingTop: Platform.OS === "ios" ? 54 : STATUS_BAR_H + 16, paddingBottom: 16 },
-    sidebarHeaderRow: { flexDirection: "row", alignItems: "center", marginBottom: 8 },
-    sidebarProfileTap: { flex: 1, flexDirection: "row", alignItems: "center" },
-    sidebarAvatar: { width: 58, height: 58, borderRadius: 29, backgroundColor: "rgba(255,255,255,0.25)", justifyContent: "center", alignItems: "center", borderWidth: 2, borderColor: "rgba(255,255,255,0.5)" },
-    sidebarAvatarTxt: { color: P.white, fontSize: 18, fontWeight: "800" },
-    sidebarName: { fontSize: 15, fontWeight: "800", color: P.white, marginBottom: 2 },
-    sidebarPhone: { fontSize: 12, color: "rgba(255,255,255,0.75)", marginBottom: 6 },
-    activePill: { flexDirection: "row", alignItems: "center", backgroundColor: "rgba(255,255,255,0.2)", paddingHorizontal: 9, paddingVertical: 3, borderRadius: 12, alignSelf: "flex-start" },
-    activeDot: { width: 7, height: 7, borderRadius: 4, marginRight: 5 },
-    activeTxt: { color: P.white, fontSize: 11, fontWeight: "600" },
-    sidebarCloseBtn: { width: 32, height: 32, borderRadius: 10, backgroundColor: "rgba(255,255,255,0.18)", alignItems: "center", justifyContent: "center" },
-    profileHint: { fontSize: 11, color: "rgba(172,197,168,0.6)", marginLeft: 72 },
+        {/* Unread notification alerts */}
+        {notifications.filter(n => !n.read && ["route","confirmation","general","next_pickup","trip_started"].includes(n.type)).slice(0,2).map(n => (
+          <Animated.View key={n._id} style={{ opacity:fadeAnim, transform:[{ translateY:cardTranslateY }], marginTop:8, marginBottom:4 }}>
+            <LinearGradient
+              colors={n.type === "next_pickup" ? ["#F44336","#C62828"] : ["#415844","#7b807b"]}
+              start={{ x:0,y:0 }} end={{ x:1,y:1 }}
+              style={ds.alertBox}
+            >
+              <Animated.View style={{ transform:[{ scale:pulseAnim }] }}>
+                <Icon name={n.type === "next_pickup" ? "navigate" : "information-circle"} size={26} color="#fff" />
+              </Animated.View>
+              <View style={{ flex:1, marginLeft:12 }}>
+                <Text style={ds.alertTitle}>{n.title}</Text>
+                <Text style={ds.alertText}>{n.message}</Text>
+                <View style={ds.alertBtns}>
+                  <TouchableOpacity style={ds.confirmBtn} onPress={() => { markNotifRead(n._id); navigation.navigate("Notifications"); }}>
+                    <Icon name="eye" size={16} color="#fff" /><Text style={ds.btnText}>View</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity style={ds.cancelBtn} onPress={() => markNotifRead(n._id)}>
+                    <Icon name="close-circle" size={16} color="#fff" /><Text style={ds.btnText}>Dismiss</Text>
+                  </TouchableOpacity>
+                </View>
+              </View>
+            </LinearGradient>
+          </Animated.View>
+        ))}
 
-    sidebarScroll: { flex: 1, paddingTop: 12 },
-    menuSectionLabel: { fontSize: 11, fontWeight: "700", color: "#aaa", marginBottom: 6, marginLeft: 20, marginTop: 8, letterSpacing: 1.2 },
+        <View style={{ paddingHorizontal:16 }}>
+          {renderActiveRouteBanner()}
+          {renderRouteStatusCard()}
+          {renderLiveMap()}
+          {renderDriverCard()}
+        </View>
+        <View style={{ height:30 }} />
+      </ScrollView>
 
-    menuItem: { flexDirection: "row", alignItems: "center", paddingHorizontal: 16, paddingVertical: 13, gap: 12, position: "relative" },
-    menuItemActive: { backgroundColor: P.light },
-    menuAccent: { position: "absolute", left: 0, top: 8, bottom: 8, width: 3, backgroundColor: P.main, borderRadius: 2 },
-    menuIconBox: { width: 36, height: 36, borderRadius: 10, backgroundColor: "#F5F7F5", alignItems: "center", justifyContent: "center" },
-    menuIconBoxActive: { backgroundColor: P.main },
-    menuItemTxt: { flex: 1, fontSize: 14, fontWeight: "600", color: P.textMid },
-    menuItemTxtActive: { color: P.textDark, fontWeight: "800" },
-    menuBadge: { backgroundColor: P.error, borderRadius: 10, minWidth: 20, height: 20, alignItems: "center", justifyContent: "center", paddingHorizontal: 4 },
-    menuBadgeTxt: { fontSize: 9, color: P.white, fontWeight: "900" },
-    menuDivider: { height: 1, backgroundColor: "#E5EBE5", marginHorizontal: 16, marginVertical: 8 },
+      {/* Chat modal — fully connected to backend */}
+      <Modal visible={chatVisible} animationType="slide">
+        <View style={ds.chatContainer}>
+          {/* Header */}
+          <LinearGradient colors={[C.main, C.dark]} start={{ x:0,y:0 }} end={{ x:1,y:0 }} style={ds.chatHeader}>
+            <TouchableOpacity onPress={closeChatWithDriver} hitSlop={{ top:8,bottom:8,left:8,right:8 }}>
+              <Icon name="arrow-back" size={24} color="#fff" />
+            </TouchableOpacity>
+            <View style={ds.chatAvatar}>
+              <Text style={ds.chatAvatarTxt}>{getInitials(driverInfo.name)}</Text>
+            </View>
+            <View style={{ flex:1 }}>
+              <Text style={ds.chatName}>{driverInfo.name}</Text>
+              <Text style={ds.chatSub}>Driver</Text>
+            </View>
+          </LinearGradient>
 
-    loaderOverlay: { position: "absolute", left: 0, top: 0, right: 0, bottom: 0, backgroundColor: "rgba(0,0,0,0.35)", alignItems: "center", justifyContent: "center", zIndex: 200 },
-    loaderBox: { backgroundColor: P.white, borderRadius: 20, padding: 28, alignItems: "center", gap: 12, ...Platform.select({ ios: { shadowColor: "#000", shadowOpacity: 0.15, shadowRadius: 12, shadowOffset: { width: 0, height: 4 } }, android: { elevation: 8 } }) },
-    loaderTxt: { fontSize: 13, color: P.textLight, fontWeight: "600" },
-  })
+          {/* Ride-active status banner */}
+          {assignedRoute?.status !== "in_progress" ? (
+            <View style={ds.chatBanner}>
+              <Icon name="lock-closed-outline" size={14} color="#c0392b" />
+              <Text style={[ds.chatBannerTxt, { color:"#c0392b" }]}>
+                {"  "}Chat is only available during an active ride
+              </Text>
+            </View>
+          ) : (
+            <View style={ds.chatBanner}>
+              <Icon name="create-outline" size={14} color={typedCount < 3 ? "#555" : "#c0392b"} />
+              <Text style={[ds.chatBannerTxt, { color: typedCount < 3 ? "#555" : "#c0392b" }]}>
+                {"  "}{typedCount < 3
+                  ? `Typed messages remaining: ${3 - typedCount}/3`
+                  : "No typed messages left — use quick replies"}
+              </Text>
+            </View>
+          )}
+
+          {/* Messages list */}
+          <FlatList
+            ref={flatListRef}
+            data={chatMessages}
+            keyExtractor={(item, i) => item._id?.toString() || String(i)}
+            renderItem={({ item }) => (
+              <View style={[ds.bubble, item.fromDriver ? ds.bubbleDriver : ds.bubbleUser]}>
+                {item.isQuickReply && (
+                  <View style={ds.quickBadge}>
+                    <Text style={ds.quickBadgeTxt}>⚡ Quick Reply</Text>
+                  </View>
+                )}
+                <Text style={[ds.bubbleTxt, item.fromDriver ? {} : { color:"#fff" }]}>{item.text}</Text>
+                <Text style={[ds.bubbleTime, item.fromDriver ? {} : { color:"rgba(255,255,255,0.7)" }]}>{item.time}</Text>
+              </View>
+            )}
+            contentContainerStyle={{ padding:16, paddingBottom:8 }}
+            onContentSizeChange={() => flatListRef.current?.scrollToEnd({ animated:true })}
+            ListEmptyComponent={
+              <View style={{ alignItems:"center", paddingTop:60 }}>
+                <Icon name="chatbubble-ellipses-outline" size={48} color="#ccc" />
+                <Text style={{ color:"#bbb", marginTop:12, fontSize:14 }}>No messages yet</Text>
+                <Text style={{ color:"#ccc", fontSize:12, marginTop:4, textAlign:"center", paddingHorizontal:30 }}>
+                  {assignedRoute?.status === "in_progress"
+                    ? "Send a message or quick reply below"
+                    : "Start an active ride to chat with your driver"}
+                </Text>
+              </View>
+            }
+          />
+
+          {/* Quick replies row */}
+          {assignedRoute?.status === "in_progress" && (
+            <View style={ds.quickRow}>
+              <Text style={{ fontSize:11, color:"#888", fontWeight:"700", paddingHorizontal:12, paddingBottom:4 }}>Quick Replies</Text>
+              <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ paddingHorizontal:12 }}>
+                {[
+                  "I am on my way to the stop.",
+                  "I will need approximately 2 minutes.",
+                  "I will need approximately 5 minutes.",
+                  "I am currently delayed. Please wait.",
+                  "I am reaching the stop now.",
+                  "I have arrived at the stop.",
+                  "Please proceed. I am ready.",
+                  "Kindly wait for 1 minute.",
+                ].map((qr, idx) => (
+                  <TouchableOpacity
+                    key={idx}
+                    style={ds.quickChip}
+                    onPress={() => sendMessage(qr, "quick_reply")}
+                  >
+                    <Text style={ds.quickChipTxt}>{qr}</Text>
+                  </TouchableOpacity>
+                ))}
+              </ScrollView>
+            </View>
+          )}
+
+          {/* Input row */}
+          {assignedRoute?.status === "in_progress" && (
+            <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : "height"} keyboardVerticalOffset={80}>
+              <View style={ds.chatInputRow}>
+                <TextInput
+                  style={[ds.chatInput, typedCount >= 3 && { backgroundColor:"#fafafa", color:"#bbb" }]}
+                  placeholder={typedCount < 3 ? `Type a message... (${3 - typedCount} left)` : "Use quick replies above ↑"}
+                  placeholderTextColor={typedCount < 3 ? "#999" : "#c0392b"}
+                  value={inputText}
+                  onChangeText={setInputText}
+                  editable={typedCount < 3}
+                  multiline
+                  maxLength={500}
+                />
+                <TouchableOpacity
+                  onPress={() => sendMessage(inputText, "typed")}
+                  disabled={!inputText.trim() || typedCount >= 3 || chatSending}
+                >
+                  <LinearGradient
+                    colors={inputText.trim() && typedCount < 3 ? [C.main, C.dark] : ["#ccc","#bbb"]}
+                    style={ds.sendBtn}
+                  >
+                    <Icon name="send" size={17} color="#fff" />
+                  </LinearGradient>
+                </TouchableOpacity>
+              </View>
+            </KeyboardAvoidingView>
+          )}
+        </View>
+      </Modal>
+
+      {loading && (
+        <View style={ds.loadingOverlay}>
+          <ActivityIndicator size="large" color={C.main} />
+          <Text style={{ color:"#fff", marginTop:10, fontSize:15 }}>Loading...</Text>
+        </View>
+      )}
+
+      {/* ── "I'm Not Going" Confirmation Modal ── */}
+      <Modal visible={showNotGoingModal} transparent animationType="fade" onRequestClose={() => setShowNotGoingModal(false)}>
+        <View style={{ flex:1, backgroundColor:"rgba(0,0,0,0.6)", justifyContent:"center", alignItems:"center", paddingHorizontal:24 }}>
+          <View style={{ backgroundColor:"#1E293B", borderRadius:20, padding:24, width:"100%", maxWidth:380 }}>
+            {/* Header */}
+            <View style={{ alignItems:"center", marginBottom:18 }}>
+              <View style={{ width:60, height:60, borderRadius:30, backgroundColor:"rgba(220,38,38,0.2)", alignItems:"center", justifyContent:"center", marginBottom:12 }}>
+                <Icon name="close-circle" size={36} color="#EF4444" />
+              </View>
+              <Text style={{ color:"#F1F5F9", fontSize:20, fontWeight:"900", textAlign:"center" }}>
+                Not Going Today?
+              </Text>
+              <Text style={{ color:"#94A3B8", fontSize:13, textAlign:"center", marginTop:6 }}>
+                This will notify your driver and mark you as absent.
+              </Text>
+            </View>
+
+            {/* Offense & Penalty Info */}
+            <View style={{ backgroundColor:"rgba(239,68,68,0.12)", borderRadius:14, padding:16, marginBottom:18, borderWidth:1, borderColor:"rgba(239,68,68,0.25)" }}>
+              <View style={{ flexDirection:"row", justifyContent:"space-between", marginBottom:8 }}>
+                <Text style={{ color:"#94A3B8", fontSize:13 }}>This will be your</Text>
+                <Text style={{ color:"#EF4444", fontSize:13, fontWeight:"800" }}>
+                  Offense #{notGoingOffenses + 1}
+                </Text>
+              </View>
+              <View style={{ flexDirection:"row", justifyContent:"space-between", marginBottom:4 }}>
+                <Text style={{ color:"#94A3B8", fontSize:13 }}>Penalty amount</Text>
+                <Text style={{ color:"#EF4444", fontSize:15, fontWeight:"900" }}>
+                  + Rs. {notGoingOffenses === 0 ? 50 : 50 + notGoingOffenses * 10}
+                </Text>
+              </View>
+              <Text style={{ color:"#64748B", fontSize:11, marginTop:8, textAlign:"center" }}>
+                Penalty is added to your monthly payment to the transporter.
+              </Text>
+            </View>
+
+            {/* Buttons */}
+            <TouchableOpacity
+              style={{ backgroundColor:"#DC2626", borderRadius:12, paddingVertical:14, alignItems:"center", flexDirection:"row", justifyContent:"center", gap:8, marginBottom:10 }}
+              onPress={handleNotGoing}
+              disabled={notGoingLoading}
+              activeOpacity={0.85}
+            >
+              {notGoingLoading
+                ? <ActivityIndicator size="small" color="#fff" />
+                : <><Icon name="close-circle" size={20} color="#fff" /><Text style={{ color:"#fff", fontWeight:"900", fontSize:15 }}>Yes, I'm Not Going</Text></>
+              }
+            </TouchableOpacity>
+            <TouchableOpacity
+              style={{ borderRadius:12, paddingVertical:13, alignItems:"center", backgroundColor:"rgba(255,255,255,0.08)" }}
+              onPress={() => setShowNotGoingModal(false)}
+              disabled={notGoingLoading}
+              activeOpacity={0.85}
+            >
+              <Text style={{ color:"#94A3B8", fontWeight:"700", fontSize:15 }}>Cancel — I'll Go</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </Modal>
+    </View>
+  );
+}
+
+const ds = StyleSheet.create({
+  container:         { flex:1, backgroundColor:"#F5F7FA" },
+  header:            { flexDirection:"row", alignItems:"center", justifyContent:"space-between", paddingHorizontal:18, paddingTop:46, paddingBottom:10 },
+  headerTitle:       { fontSize:20, fontWeight:"800", color:"#fff", letterSpacing:0.5 },
+  notifWrap:         { position:"relative", padding:4 },
+  blinkDot:          { position:"absolute", top:2, right:2, width:10, height:10, borderRadius:5, backgroundColor:"#E87878" },
+  badge:             { position:"absolute", top:-4, right:-4, backgroundColor:"#7A3030", borderRadius:9, minWidth:18, height:18, alignItems:"center", justifyContent:"center", paddingHorizontal:3 },
+  badgeTxt:          { color:"#fff", fontSize:10, fontWeight:"800" },
+  scroll:            { paddingBottom:30 },
+
+  // ── Boarding banner ──────────────────────────────────────────────────────
+  boardingBanner: {
+    flexDirection:"row", alignItems:"center",
+    backgroundColor:"#B45309", margin:16, borderRadius:16, padding:14,
+    ...Platform.select({ ios:{ shadowColor:"#000", shadowOpacity:0.2, shadowRadius:8, shadowOffset:{ width:0, height:4 } }, android:{ elevation:6 } }),
+  },
+  boardingIconWrap:       { width:44, height:44, borderRadius:22, backgroundColor:"rgba(255,255,255,0.2)", alignItems:"center", justifyContent:"center" },
+  boardingBannerTitle:    { fontSize:15, fontWeight:"900", color:"#fff" },
+  boardingBannerSub:      { fontSize:12, color:"rgba(255,255,255,0.8)", marginTop:2 },
+  boardingConfirmBtn:     { flexDirection:"row", alignItems:"center", gap:6, backgroundColor:"#415844", borderRadius:12, paddingHorizontal:14, paddingVertical:10 },
+  boardingConfirmBtnTxt:  { color:"#fff", fontWeight:"900", fontSize:13 },
+
+  // ── Going to destination banner ──────────────────────────────────────────
+  goingDestBanner: {
+    flexDirection:"row", alignItems:"center", gap:10,
+    backgroundColor:"#1D4ED8", marginHorizontal:16, marginBottom:10, borderRadius:14, padding:14,
+    ...Platform.select({ ios:{ shadowColor:"#000", shadowOpacity:0.15, shadowRadius:6, shadowOffset:{ width:0, height:3 } }, android:{ elevation:4 } }),
+  },
+  goingDestTitle: { color:"#fff", fontWeight:"900", fontSize:14 },
+  goingDestSub:   { color:"rgba(255,255,255,0.8)", fontSize:12, marginTop:2 },
+
+  alertBox:          { flexDirection:"row", borderRadius:16, padding:16, marginHorizontal:16, shadowColor:"#000", shadowOffset:{width:0,height:4}, shadowOpacity:0.18, shadowRadius:8, elevation:6 },
+  alertTitle:        { fontSize:15, fontWeight:"800", color:"#fff", marginBottom:4 },
+  alertText:         { fontSize:13, color:"rgba(255,255,255,0.9)", marginBottom:2 },
+  alertBtns:         { flexDirection:"row", marginTop:10, gap:8 },
+  confirmBtn:        { flexDirection:"row", alignItems:"center", backgroundColor:"rgba(255,255,255,0.2)", paddingVertical:8, paddingHorizontal:14, borderRadius:20, gap:6 },
+  cancelBtn:         { flexDirection:"row", alignItems:"center", backgroundColor:"rgba(0,0,0,0.2)", paddingVertical:8, paddingHorizontal:14, borderRadius:20, gap:6 },
+  btnText:           { color:"#fff", fontWeight:"700", fontSize:13 },
+  activeBanner:      { flexDirection:"row", alignItems:"center", borderRadius:16, padding:16, ...Platform.select({ ios:{shadowColor:"#000",shadowOpacity:0.2,shadowRadius:10,shadowOffset:{width:0,height:4}}, android:{elevation:6} }) },
+  activeBannerIcon:  { width:52, height:52, borderRadius:16, alignItems:"center", justifyContent:"center", flexShrink:0 },
+  activeBannerTitle: { fontSize:16, fontWeight:"900", marginBottom:4, letterSpacing:-0.2 },
+  activeBannerSub:   { fontSize:13, color:"rgba(255,255,255,0.75)", lineHeight:18 },
+  etaPill:           { flexDirection:"row", alignItems:"center", gap:4, backgroundColor:"rgba(229,154,42,0.2)", borderRadius:8, paddingVertical:4, paddingHorizontal:8, alignSelf:"flex-start", marginTop:6 },
+  etaPillTxt:        { fontSize:11, fontWeight:"700", color:"#E59A2A" },
+  card:              { backgroundColor:"#fff", borderRadius:16, marginBottom:2, overflow:"hidden", ...Platform.select({ ios:{shadowColor:"#000",shadowOpacity:0.08,shadowRadius:8,shadowOffset:{width:0,height:2}}, android:{elevation:4} }) },
+  cardHeader:        { flexDirection:"row", alignItems:"center", paddingHorizontal:16, paddingVertical:12, gap:8 },
+  cardHeaderTxt:     { fontSize:15, fontWeight:"800", color:"#fff", flex:1 },
+  cardBody:          { padding:16 },
+  liveChip:          { flexDirection:"row", alignItems:"center", gap:5, backgroundColor:"rgba(255,255,255,0.15)", borderRadius:8, paddingVertical:3, paddingHorizontal:8 },
+  liveDot:           { width:7, height:7, borderRadius:3.5, backgroundColor:"#fff" },
+  liveTxt:           { color:"#fff", fontSize:9, fontWeight:"800", letterSpacing:0.8 },
+  statusPill:        { flexDirection:"row", alignItems:"center", alignSelf:"flex-start", paddingVertical:6, paddingHorizontal:12, borderRadius:20, gap:6, marginBottom:12 },
+  statusPillTxt:     { fontSize:13, fontWeight:"700" },
+  routeName:         { fontSize:17, fontWeight:"800", color:"#0F1A10", marginBottom:12, letterSpacing:-0.3 },
+  infoGrid:          { flexDirection:"row", flexWrap:"wrap", gap:10, marginBottom:12 },
+  infoItem:          { backgroundColor:"#F0F9F1", borderRadius:10, padding:10, alignItems:"center", minWidth:90, flex:1 },
+  infoLabel:         { fontSize:10, color:"#888", marginTop:4, marginBottom:2 },
+  infoValue:         { fontSize:14, fontWeight:"700", color:"#333" },
+  pickupRow:         { flexDirection:"row", alignItems:"center", backgroundColor:"#FFF8E1", borderRadius:10, padding:10, gap:6, marginBottom:8 },
+  pickupLabel:       { fontSize:13, fontWeight:"700", color:"#FF9800" },
+  pickupValue:       { fontSize:13, color:"#555", flex:1 },
+  statusRow:         { flexDirection:"row", alignItems:"center", borderRadius:10, padding:10, gap:8, marginTop:4 },
+  statusRowTxt:      { fontSize:13, fontWeight:"700" },
+  noRouteTxt:        { color:"#999", fontSize:14, lineHeight:20, marginTop:4 },
+  driverBox:         { flexDirection:"row", alignItems:"flex-start", padding:16 },
+  driverAvatar:      { width:56, height:56, borderRadius:17, alignItems:"center", justifyContent:"center" },
+  driverAvatarTxt:   { fontSize:20, fontWeight:"900", color:"#fff" },
+  driverName:        { fontSize:16, fontWeight:"800", color:"#0F1A10", marginBottom:4, letterSpacing:-0.2 },
+  ratingRow:         { flexDirection:"row", alignItems:"center", marginBottom:4 },
+  ratingTxt:         { fontSize:12, color:"#666" },
+  vehicleRow:        { flexDirection:"row", alignItems:"center", gap:5, marginBottom:3 },
+  vehicleTxt:        { fontSize:13, color:"#555" },
+  plateBadge:        { backgroundColor:"#F5F5F5", borderRadius:6, paddingHorizontal:7, paddingVertical:2, borderWidth:1, borderColor:"#E0E0E0" },
+  plateTxt:          { fontSize:11, fontWeight:"700", color:"#333", letterSpacing:1 },
+  driverActions:     { alignItems:"center", paddingLeft:8 },
+  actionBtn:         { width:40, height:40, borderRadius:20, borderWidth:1.5, borderColor:"#415844", alignItems:"center", justifyContent:"center" },
+  routeInfoBar:      { flexDirection:"row", borderTopWidth:1, borderTopColor:"#F0F0F0", padding:12, gap:8, flexWrap:"wrap" },
+  routeInfoChip:     { flexDirection:"row", alignItems:"center", backgroundColor:"#F0F9F1", borderRadius:8, paddingVertical:5, paddingHorizontal:10, gap:4 },
+  routeInfoTxt:      { fontSize:12, color:"#555", fontWeight:"600" },
+  vanMarker:         { backgroundColor:"#415844", padding:7, borderRadius:18, borderWidth:2, borderColor:"#fff", elevation:6 },
+  stopPin:           { width:26, height:26, borderRadius:13, alignItems:"center", justifyContent:"center", borderWidth:2, borderColor:"#fff", elevation:3 },
+  destPin:           { width:34, height:34, borderRadius:17, backgroundColor:"#DC2626", alignItems:"center", justifyContent:"center", borderWidth:2, borderColor:"#fff", elevation:5 },
+  etaBar:            { flexDirection:"row", alignItems:"center", padding:12, gap:8, backgroundColor:"#FFF8E1" },
+  etaBarTxt:         { fontSize:13, color:"#FF9800", fontWeight:"600", flex:1 },
+  chatContainer:     { flex:1, backgroundColor:"#F2F5F2" },
+  chatHeader:        { flexDirection:"row", alignItems:"center", paddingHorizontal:16, paddingTop:50, paddingBottom:14, gap:12 },
+  chatAvatar:        { width:38, height:38, borderRadius:19, backgroundColor:"rgba(255,255,255,0.3)", alignItems:"center", justifyContent:"center" },
+  chatAvatarTxt:     { fontSize:15, fontWeight:"800", color:"#fff" },
+  chatName:          { fontSize:15, fontWeight:"800", color:"#fff" },
+  chatSub:           { fontSize:12, color:"rgba(255,255,255,0.8)" },
+  chatBanner:        { flexDirection:"row", alignItems:"center", backgroundColor:"#fffde7", paddingHorizontal:14, paddingVertical:8, borderBottomWidth:1, borderBottomColor:"#eee" },
+  chatBannerTxt:     { fontSize:12, flex:1 },
+  bubble:            { maxWidth:"75%", borderRadius:16, padding:12, marginBottom:8 },
+  bubbleDriver:      { backgroundColor:"#fff", alignSelf:"flex-start", elevation:2 },
+  bubbleUser:        { backgroundColor:"#415844", alignSelf:"flex-end" },
+  bubbleTxt:         { fontSize:14, color:"#0F1A10" },
+  bubbleTime:        { fontSize:11, color:"#999", marginTop:4, textAlign:"right" },
+  quickBadge:        { backgroundColor:"rgba(0,0,0,0.07)", borderRadius:8, paddingHorizontal:6, paddingVertical:2, alignSelf:"flex-start", marginBottom:4 },
+  quickBadgeTxt:     { fontSize:9, color:"#666" },
+  quickRow:          { backgroundColor:"#fff", paddingHorizontal:12, paddingVertical:10, borderTopWidth:1, borderTopColor:"#eee" },
+  quickChip:         { backgroundColor:"#e8f5e9", borderRadius:20, paddingHorizontal:14, paddingVertical:8, marginRight:8, borderWidth:1, borderColor:"#415844" },
+  quickChipTxt:      { color:"#2e7d32", fontSize:12, fontWeight:"600" },
+  chatInputRow:      { flexDirection:"row", alignItems:"center", padding:12, backgroundColor:"#fff", gap:8, borderTopWidth:1, borderTopColor:"#F0F0F0" },
+  chatInput:         { flex:1, backgroundColor:"#F2F5F2", borderRadius:20, paddingHorizontal:16, paddingVertical:10, fontSize:14, color:"#0F1A10", maxHeight:100 },
+  sendBtn:           { width:40, height:40, borderRadius:20, alignItems:"center", justifyContent:"center" },
+  chatRedDot:        { position:"absolute", top:-5, right:-5, backgroundColor:"#EF4444", borderRadius:8, minWidth:16, height:16, alignItems:"center", justifyContent:"center", paddingHorizontal:2, borderWidth:1.5, borderColor:"#fff" },
+  chatRedDotTxt:     { fontSize:8, color:"#fff", fontWeight:"900" },
+  loadingOverlay:    { ...StyleSheet.absoluteFillObject, backgroundColor:"rgba(0,0,0,0.45)", alignItems:"center", justifyContent:"center", zIndex:999 },
+
+  // ── Trip info card (pickup / dropoff rows) ────────────────────────────────
+  tripInfoRow:       { flexDirection:"row", alignItems:"center", backgroundColor:"#F8FAFF", borderRadius:10, padding:11, gap:10, marginBottom:0 },
+  tripDot:           { width:10, height:10, borderRadius:5, flexShrink:0 },
+  tripInfoLabel:     { fontSize:10, color:"#888", fontWeight:"700", marginBottom:2, textTransform:"uppercase", letterSpacing:0.5 },
+  tripInfoValue:     { fontSize:13, color:"#1F2937", fontWeight:"700", lineHeight:18 },
+});
