@@ -667,4 +667,130 @@ router.delete('/:routeId', auth, async (req, res) => {
   } catch { res.status(500).json({ success: false }); }
 });
 
+// ═════════════════════════════════════════════════════════════════
+// GET /api/routes/merge-candidate
+//
+// Called by a driver who is one stop away from their destination.
+// Finds another in_progress route that:
+//   1. Has the same destination (by name match or lat/lng proximity)
+//   2. Belongs to a DIFFERENT driver
+//   3. Is currently active (in_progress)
+//   4. Has a compatible timing — the other driver's ETA to the
+//      destination is within MERGE_WINDOW_MINUTES of this driver's
+//      ETA (so passengers don't wait excessively).
+//
+// Query params:
+//   routeId          — the calling driver's current route ID
+//   destinationLat   — lat of the shared destination
+//   destinationLng   — lng of the shared destination
+//   driverLat        — calling driver's current latitude
+//   driverLng        — calling driver's current longitude
+//   remainingStops   — how many pickup stops remain for this driver
+//   timeSlot         — the route's time slot string (optional, for
+//                      same-slot matching as a secondary filter)
+// ═════════════════════════════════════════════════════════════════
+const MERGE_WINDOW_MINUTES = 12;  // max time difference between the
+                                   // two drivers' ETAs at destination
+const DEST_MATCH_KM        = 1.0; // routes share a destination if
+                                   // their dest coords are within 1 km
+
+function haversineKm(lat1, lng1, lat2, lng2) {
+  const R  = 6371;
+  const dL = (lat2 - lat1) * Math.PI / 180;
+  const dl = (lng2 - lng1) * Math.PI / 180;
+  const a  = Math.sin(dL / 2) ** 2
+            + Math.cos(lat1 * Math.PI / 180)
+            * Math.cos(lat2 * Math.PI / 180)
+            * Math.sin(dl / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+// Rough ETA estimate: assume 30 km/h average urban speed
+function estimateEtaMinutes(distKm) {
+  return (distKm / 30) * 60;
+}
+
+router.get('/merge-candidate', auth, async (req, res) => {
+  try {
+    const {
+      routeId,
+      destinationLat,
+      destinationLng,
+      driverLat,
+      driverLng,
+      remainingStops,
+      timeSlot,
+    } = req.query;
+
+    if (!routeId || !destinationLat || !destinationLng || !driverLat || !driverLng) {
+      return res.status(400).json({ success: false, message: 'Missing required query parameters.' });
+    }
+
+    const myDestLat  = parseFloat(destinationLat);
+    const myDestLng  = parseFloat(destinationLng);
+    const myLat      = parseFloat(driverLat);
+    const myLng      = parseFloat(driverLng);
+    const myStopsLeft = parseInt(remainingStops, 10) || 0;
+
+    // My ETA to destination (straight-line, rough estimate)
+    const myDistToDestKm = haversineKm(myLat, myLng, myDestLat, myDestLng);
+    const myEtaMin       = estimateEtaMinutes(myDistToDestKm);
+
+    // Find all other in_progress routes except my own
+    const candidates = await Route.find({
+      _id:    { $ne: routeId },
+      status: 'in_progress',
+      assignedDriver: { $ne: req.userId },
+    }).lean();
+
+    for (const candidate of candidates) {
+      const cDestLat = candidate.destinationLat;
+      const cDestLng = candidate.destinationLng;
+
+      // Skip if no destination coordinates stored
+      if (!cDestLat || !cDestLng) continue;
+
+      // Check if destination is the same (within DEST_MATCH_KM)
+      const destDist = haversineKm(myDestLat, myDestLng, cDestLat, cDestLng);
+      if (destDist > DEST_MATCH_KM) continue;
+
+      // Use the other driver's last known location from Route.currentLocation
+      const cLoc = candidate.currentLocation;
+      if (!cLoc?.latitude || !cLoc?.longitude) continue;
+
+      const cDistToDestKm = haversineKm(cLoc.latitude, cLoc.longitude, cDestLat, cDestLng);
+      const cEtaMin       = estimateEtaMinutes(cDistToDestKm);
+
+      // Timing compatibility: the two ETAs must be within MERGE_WINDOW_MINUTES
+      const timeDiffMin = Math.abs(myEtaMin - cEtaMin);
+      if (timeDiffMin > MERGE_WINDOW_MINUTES) continue;
+
+      // This candidate qualifies — return it
+      const pendingPassengers = (candidate.passengers || []).filter(
+        p => p.status !== 'picked' && p.status !== 'missed'
+      );
+
+      return res.json({
+        success:          true,
+        candidate: {
+          routeId:          candidate._id.toString(),
+          driverName:       candidate.driverName || 'Another Driver',
+          routeName:        candidate.routeName || candidate.name || 'Route',
+          destination:      candidate.destination || 'Shared Destination',
+          pendingPassengers: pendingPassengers.length,
+          myEtaMin:         Math.round(myEtaMin),
+          otherEtaMin:      Math.round(cEtaMin),
+          timeDiffMin:      Math.round(timeDiffMin),
+        },
+      });
+    }
+
+    // No compatible merge candidate found
+    return res.json({ success: true, candidate: null });
+  } catch (err) {
+    console.error('[merge-candidate] error:', err);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 module.exports = router;
