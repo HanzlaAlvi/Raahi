@@ -29,7 +29,7 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 // ─── Constants ────────────────────────────────────────────────────────────────
 const API_BASE   = "https://raahi-q2ur.onrender.com/api";
 const SOCKET_URL = "https://raahi-q2ur.onrender.com";
-const GMAPS_KEY  = "AIzaSyAURA_WOTStUtf3-nnDUR88jeBr6qSejFs";   // ← replace with actual key
+const GMAPS_KEY  = "AIzaSyDs8abfEYT5Y1jQ-m9gYeL0kTAxAU5HJSU";   // ← replace with actual key
 const MAX_TYPED  = 3;
 const LOC_INTERVAL_MS = 7000;   // send location every 7 seconds
 
@@ -611,20 +611,9 @@ export default function RoutesScreen({
     console.log('[Driver] Generating polyline from live GPS:', dLat.toFixed(5), dLng.toFixed(5));
 
     const pickupWaypoints = routeStops
-      .filter(s => s.status !== "picked" && s.status !== "missed" && !s._isDriverOrigin)
+      .filter(s => s.status !== "picked" && s.status !== "missed")
       .map(s => s.coordinate)
       .filter(Boolean);
-
-    // ── IMMEDIATE FALLBACK: Draw straight-line through all stops right now ────
-    // This ensures the map shows a route line BEFORE the Google/OSRM async call
-    // resolves, and even if both APIs fail (e.g. no internet or invalid key).
-    const immediateFallback = [
-      { latitude: dLat, longitude: dLng },
-      ...pickupWaypoints,
-    ].filter(c => c?.latitude != null);
-    if (immediateFallback.length > 1) {
-      setPolylineCoords(immediateFallback);
-    }
 
     const dropOff = currentRoute.dropOffLocation;
     const destLat = dropOff?.latitude
@@ -636,20 +625,15 @@ export default function RoutesScreen({
       || currentRoute.passengers?.[0]?.destinationLng
       || currentRoute.passengers?.[0]?.dropLng;
 
-    // If no destination coords, use last pickup stop as destination
-    // so we can still show a route line and attempt the API call
-    const finalDestLat = destLat || pickupWaypoints[pickupWaypoints.length - 1]?.latitude || dLat;
-    const finalDestLng = destLng || pickupWaypoints[pickupWaypoints.length - 1]?.longitude || dLng;
-    const destIsReal = !!(destLat && destLng);
-
-    if (!destIsReal) {
-      console.warn('[Driver] No destination coords — drawing straight-line to last pickup stop');
-      // Still continue below to update the immediateFallback if coords become available later
+    if (!destLat || !destLng) {
+      console.warn('[Driver] No destination coordinates found — cannot generate polyline');
+      polylineSentRef.current = false;
+      return;
     }
 
     const dropOffLocation = {
-      latitude:  Number(finalDestLat),
-      longitude: Number(finalDestLng),
+      latitude:  Number(destLat),
+      longitude: Number(destLng),
       name:      currentRoute.destination || dropOff?.name || "Destination",
       address:   currentRoute.destination || dropOff?.address || "",
     };
@@ -657,11 +641,11 @@ export default function RoutesScreen({
     const rideId  = currentRoute.tripId || currentRoute._id;
     const routeId = currentRoute._id;
 
-    // Try Google Directions API first (uses finalDestLat/Lng — always valid)
+    // Try Google Directions API first
     const encoded = await fetchGoogleRoute(
       { latitude: dLat, longitude: dLng },
       pickupWaypoints,
-      { latitude: Number(finalDestLat), longitude: Number(finalDestLng) }
+      { latitude: Number(destLat), longitude: Number(destLng) }
     );
 
     if (encoded) {
@@ -675,8 +659,8 @@ export default function RoutesScreen({
         encodedPolyline: encoded,
         dropOffLocation,
         destination:    currentRoute.destination    || dropOffLocation.name,
-        destinationLat: Number(finalDestLat),
-        destinationLng: Number(finalDestLng),
+        destinationLat: Number(destLat),
+        destinationLng: Number(destLng),
         driverName:     currentRoute.driverName     || "Driver",
         vehicleType:    currentRoute.vehicleType    || "Van",
         timestamp:      Date.now(),
@@ -711,13 +695,13 @@ export default function RoutesScreen({
       const osrmCoords = await fetchOsrmRoute(
         { latitude: dLat, longitude: dLng },
         pickupWaypoints,
-        { latitude: Number(finalDestLat), longitude: Number(finalDestLng) }
+        { latitude: Number(destLat), longitude: Number(destLng) }
       );
 
       const fallbackCoords = osrmCoords || [
         { latitude: dLat, longitude: dLng },
         ...pickupWaypoints,
-        { latitude: Number(finalDestLat), longitude: Number(finalDestLng) },
+        { latitude: Number(destLat), longitude: Number(destLng) },
       ].filter(c => c?.latitude && c?.longitude);
 
       setPolylineCoords(fallbackCoords);
@@ -728,8 +712,8 @@ export default function RoutesScreen({
         waypointCoords:  fallbackCoords,
         dropOffLocation,
         destination:    currentRoute.destination    || dropOffLocation.name,
-        destinationLat: Number(finalDestLat),
-        destinationLng: Number(finalDestLng),
+        destinationLat: Number(destLat),
+        destinationLng: Number(destLng),
         driverName:     currentRoute.driverName     || "Driver",
         vehicleType:    currentRoute.vehicleType    || "Van",
         timestamp:      Date.now(),
@@ -990,17 +974,14 @@ Would you like to coordinate with them? Your passengers can transfer to their va
 
   const dropCoords = dropStops.map(d => d.coordinate);
 
-  // Use Google/OSRM polyline if available, else fallback to straight lines.
-  // The immediate fallback in generateAndBroadcastPolyline sets polylineCoords
-  // to a straight-line through all stops as soon as the route starts, so this
-  // branch (polylineCoords.length <= 1) is only a final safety net.
+  // Use Google polyline if available, else fallback to straight lines
+  // CRITICAL: fallback MUST start from driver's current LIVE position
   const mapPolylineCoords = polylineCoords.length > 1 ? polylineCoords : [
     ...(currentLocation
       ? [{ latitude: currentLocation.latitude, longitude: currentLocation.longitude }]
       : (driverOriginStop ? [driverOriginStop.coordinate] : [])
     ),
-    // Include all stop coords EXCEPT driver origin (already covered by currentLocation above)
-    ...stopCoords.filter((_, i) => !routeStops[i]?._isDriverOrigin),
+    ...stopCoords,
     ...dropCoords,
   ].filter(c => c?.latitude != null && c?.longitude != null);
 

@@ -131,7 +131,7 @@ export default function DriverChatModal({
         >
           {/* Hamburger — opens sidebar */}
           <TouchableOpacity
-            style={s.appBarBtn}
+            style={s.appBarBtn}z
             onPress={onOpenSidebar}
             hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
             activeOpacity={0.75}

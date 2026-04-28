@@ -141,6 +141,7 @@ export default function PassengerDashboard({ navigation }) {
   const socketRef       = useRef(null);
   const activeTripIdRef = useRef(null);
   const mapRef          = useRef(null);
+  const driverLocationRef = useRef(null);  // { latitude, longitude } fetched from GET /api/drivers/:driverId
 
   const [userProfile,      setUserProfile]      = useState(null);
   const [pickupPoint,      setPickupPoint]       = useState("");
@@ -608,15 +609,49 @@ export default function PassengerDashboard({ navigation }) {
   };
 
   const buildStops = () => {
-    // ── Driver origin stop ───────────────────────────────────────────────────
-    const dLat = driverInfo?.latitude  || assignedRoute?.currentLocation?.latitude  || 33.6844;
-    const dLng = driverInfo?.longitude || assignedRoute?.currentLocation?.longitude || 73.0479;
+    // ── Driver origin coordinate — priority chain ─────────────────────────────
+    // 1. vanPos from socket (most accurate — driver IS here right now)
+    // 2. assignedRoute.currentLocation (last DB-synced van position)
+    // 3. driverInfo lat/lng (saved home location on driver profile — rarely set)
+    // 4. Visible offset ABOVE the first passenger stop (so the line is always
+    //    clearly visible and doesn't collapse to zero length)
+    //
+    // We resolve firstPassengerCoord early so option-4 works even before we
+    // build the passengerStops array below.
+    const firstPax = (allPassengers || [])[0];
+    const firstPaxCoord = firstPax ? resolvePassengerCoord(firstPax, 0) : null;
+
+    const driverCoord = (() => {
+      // Option 1 — live socket position
+      if (vanPos?.latitude && vanPos?.longitude) {
+        return { latitude: vanPos.latitude, longitude: vanPos.longitude };
+      }
+      // Option 2 — last DB-synced location on route document
+      const cl = assignedRoute?.currentLocation;
+      if (cl?.latitude && cl?.longitude &&
+          (Math.abs(cl.latitude - 33.6844) > 0.0001 || Math.abs(cl.longitude - 73.0479) > 0.0001)) {
+        return { latitude: Number(cl.latitude), longitude: Number(cl.longitude) };
+      }
+      // Option 3 — driver profile home coords (set by driver on registration)
+      if (driverInfo?.latitude && driverInfo?.longitude &&
+          (Math.abs(driverInfo.latitude - 33.6844) > 0.0001 || Math.abs(driverInfo.longitude - 73.0479) > 0.0001)) {
+        return { latitude: Number(driverInfo.latitude), longitude: Number(driverInfo.longitude) };
+      }
+      // Option 4 — clear visible offset 0.012° north (~1.3 km) above P1
+      // This guarantees a visible line from "Driver Start" down to P1 on the map.
+      if (firstPaxCoord) {
+        return { latitude: firstPaxCoord.latitude + 0.012, longitude: firstPaxCoord.longitude - 0.006 };
+      }
+      // Absolute fallback
+      return { latitude: 33.6984, longitude: 73.0379 };
+    })();
+
     const driverOrigin = {
-      _id:           "driver-origin",
+      _id:             "driver-origin",
       _isDriverOrigin: true,
-      name:          "Driver Start",
-      passengerName: "Driver",
-      coordinate:    { latitude: Number(dLat), longitude: Number(dLng) },
+      name:            "Driver Start",
+      passengerName:   "Driver",
+      coordinate:      driverCoord,
     };
 
     // ── Passenger pickup stops — allPassengers is ALREADY sorted by proximity ─
@@ -704,6 +739,31 @@ export default function PassengerDashboard({ navigation }) {
     Authorization: `Bearer ${tok || userTokenRef.current}`,
   });
 
+  // ── Fetch driver's real location from backend ─────────────────────────────
+  // Called whenever we learn the driverId (from route or trip).
+  // Stores result in driverLocationRef so buildStops() always starts from the
+  // driver's actual position — never a default or hardcoded coordinate.
+  const fetchDriverLocation = async (driverId, tok) => {
+    if (!driverId) return;
+    const t = tok || userTokenRef.current;
+    if (!t) return;
+    try {
+      const res  = await fetch(`${API_BASE_URL}/drivers/${driverId}`, { headers: getHeaders(t) });
+      const data = await res.json();
+      const drv  = data.driver || data.data || data;
+      // Pull location: prefer explicit lat/lng fields, then GeoJSON location object
+      const lat = drv?.latitude  || drv?.location?.coordinates?.[1] || null;
+      const lng = drv?.longitude || drv?.location?.coordinates?.[0] || null;
+      if (lat && lng &&
+          (Math.abs(Number(lat) - 33.6844) > 0.0001 || Math.abs(Number(lng) - 73.0479) > 0.0001)) {
+        driverLocationRef.current = { latitude: Number(lat), longitude: Number(lng) };
+        console.log('[Passenger] Driver location fetched:', driverLocationRef.current);
+      }
+    } catch (e) {
+      console.warn('[Passenger] fetchDriverLocation error:', e.message);
+    }
+  };
+
   const fetchAll = async (tok, uid) => {
     await Promise.allSettled([
       fetchAssignedRoute(tok, uid),
@@ -784,11 +844,27 @@ export default function PassengerDashboard({ navigation }) {
             rating:        drv.rating        || 4.8,
             vehicleNumber: drv.vehicleNo     || drv.vehicleNumber || "N/A",
             vehicleModel:  drv.vehicleType   || drv.vehicleModel  || "Van",
-            // Coords for pre-route polyline (driver home → first pickup)
             latitude:      drv.latitude      || drv.location?.coordinates?.[1] || null,
             longitude:     drv.longitude     || drv.location?.coordinates?.[0] || null,
-            // phone intentionally excluded — security
           });
+
+          // ── Set driverLocationRef from populated assignedDriver data ────────
+          // assignedDriver is populated (full User object) when route is fetched.
+          // Extract lat/lng directly — no extra API call needed here.
+          const dLat = drv.latitude  || drv.location?.coordinates?.[1];
+          const dLng = drv.longitude || drv.location?.coordinates?.[0];
+          if (dLat && dLng &&
+              (Math.abs(Number(dLat) - 33.6844) > 0.0001 || Math.abs(Number(dLng) - 73.0479) > 0.0001)) {
+            driverLocationRef.current = { latitude: Number(dLat), longitude: Number(dLng) };
+            console.log('[Passenger] Driver location set from route.assignedDriver:', driverLocationRef.current);
+          }
+
+          // ── Also fetch full driver profile to get latest location ───────────
+          // assignedDriver in route may be a shallow populate — full profile has fresher coords.
+          const drvId = drv._id?.toString() || drv.id?.toString();
+          if (drvId) {
+            fetchDriverLocation(drvId, t).catch(() => {});
+          }
         }
       } else {
         // If we HAD an active route and now it's gone — the trip just completed
@@ -1175,66 +1251,73 @@ export default function PassengerDashboard({ navigation }) {
   const renderLiveMap = () => {
     if (!assignedRoute || assignedRoute.status !== "in_progress") return null;
 
-    // resolvePassengerCoord always returns a valid coord (DEMO fallback) — never null
+    // ── Build full stop sequence: Driver → P1 → P2 → ... → Destination ──────
+    // buildStops() returns: [driverOrigin, ...passengerStops, ...destStops]
+    // stops[0] IS the driver origin — coordinate already resolved with correct priority.
     const stops    = buildStops();
     const vanCoord = vanPos || (stops.length > 0 ? stops[0].coordinate : null);
 
-    // ── Driver home coordinate (for pre-route line driver → P1) ──────────
-    // Priority chain — same as driver RoutesScreen:
-    // 1. driverInfo.latitude (if driver has saved home location in DB)
-    // 2. vanPos from socket (live van position = driver IS here right now)
-    // 3. assignedRoute.currentLocation (last DB-synced van location)
-    // 4. Slight offset from first stop (so line is always visible, never zero-length)
-    const firstStopCoord  = stops.length > 0 ? stops[0].coordinate : null;
-    const routeCurrentLoc = assignedRoute?.currentLocation;
-    const driverHomeCoord = (() => {
-      // Option 1: saved home location on driver profile
-      if (driverInfo.latitude && driverInfo.longitude) {
-        return { latitude: driverInfo.latitude, longitude: driverInfo.longitude };
-      }
-      // Option 2: current live van position (from socket updates)
-      if (vanPos) return vanPos;
-      // Option 3: last DB-synced van location from route.currentLocation
-      if (routeCurrentLoc?.latitude && routeCurrentLoc?.longitude) {
-        return { latitude: Number(routeCurrentLoc.latitude), longitude: Number(routeCurrentLoc.longitude) };
-      }
-      // Option 4: slight offset above first stop so line is always visible
-      if (firstStopCoord) {
-        return { latitude: firstStopCoord.latitude + 0.008, longitude: firstStopCoord.longitude };
-      }
-      return { latitude: 33.6844, longitude: 73.0479 };
+    // Driver start = stops[0] (already resolved with vanPos → currentLocation → offset priority)
+    const driverStartCoord = stops.length > 0 ? stops[0].coordinate : { latitude: 33.6844, longitude: 73.0479 };
+
+    // ── Passenger pickup stop list (no driver origin, no dest) ───────────────
+    const passengerStops = (allPassengers || []).map((p, i) => ({
+      index:         i,
+      passengerId:   p.passengerId?.toString() || p._id?.toString(),
+      name:          p.passengerName || p.name || `Passenger ${i + 1}`,
+      address:       p.pickupPoint || p.pickupAddress || `Stop ${i + 1}`,
+      status:        p.status || 'pending',
+      coordinate:    resolvePassengerCoord(p, i),
+      isMe:          (p.passengerId?.toString() || p._id?.toString()) === userIdRef.current,
+    }));
+
+    // ── Destination coordinate ───────────────────────────────────────────────
+    const destCoord = (() => {
+      if (assignedRoute.destinationLat && assignedRoute.destinationLng)
+        return { latitude: assignedRoute.destinationLat, longitude: assignedRoute.destinationLng };
+      const lastDrop = (allPassengers || []).map(p => resolveDropCoord(p)).filter(Boolean).pop();
+      return lastDrop || null;
     })();
 
-    // ── Per-passenger drop-off stops ───────────────────────────────────────
-    // resolveDropCoord returns null if no destination data — filter those out
-    const dropStops = (allPassengers || []).map((p, i) => {
-      const coord = resolveDropCoord(p);
-      if (!coord) return null;
-      return {
-        key:           `drop-${i}`,
-        coordinate:    coord,
-        passengerName: p.passengerName || p.name || `Passenger ${i + 1}`,
-        destination:   p.destination || 'Drop-off',
-        isMyDrop:      i === myStopIndex,
-      };
-    }).filter(Boolean);
+    // ── Full ordered route: driverStart → P1 → P2 → ... → Destination ───────
+    const orderedCoords = [
+      driverStartCoord,
+      ...passengerStops.map(s => s.coordinate),
+      ...(destCoord ? [destCoord] : []),
+    ];
 
-    const dropCoords     = dropStops.map(d => d.coordinate);
-    const pickupCoords   = stops.map(s => s.coordinate);
+    // ── Split polyline into "covered" (van already passed) and "ahead" ───────
+    // We find which segment the van is on, then split the route there.
+    // covered = dotted grey line  |  ahead = solid green line
+    let coveredCoords = [];
+    let aheadCoords   = [];
 
-    // ── Full route polyline (SOLID — same as driver map) ─────────────────
-    // Structure: [driverHome → P1pickup → P2pickup → ... → P1drop → P2drop]
-    // This matches exactly what RoutesScreen shows on driver side.
-    const fullPolyline = [driverHomeCoord, ...pickupCoords, ...dropCoords];
-    // Fallback: if no per-passenger drops, extend to single route destination
-    if (dropCoords.length === 0 && assignedRoute.destinationLat && assignedRoute.destinationLng) {
-      fullPolyline.push({ latitude: assignedRoute.destinationLat, longitude: assignedRoute.destinationLng });
+    if (vanCoord && orderedCoords.length > 1) {
+      // Find nearest segment to current van position
+      let nearestSeg   = 0;
+      let nearestDist  = Infinity;
+      for (let s = 0; s < orderedCoords.length - 1; s++) {
+        const midLat = (orderedCoords[s].latitude  + orderedCoords[s + 1].latitude)  / 2;
+        const midLng = (orderedCoords[s].longitude + orderedCoords[s + 1].longitude) / 2;
+        const d = haversine(vanCoord.latitude, vanCoord.longitude, midLat, midLng);
+        if (d < nearestDist) { nearestDist = d; nearestSeg = s; }
+      }
+      // covered = start → van's current position (insert van midway on nearest seg)
+      coveredCoords = [...orderedCoords.slice(0, nearestSeg + 1), vanCoord];
+      // ahead = van's current position → remaining stops → destination
+      aheadCoords   = [vanCoord, ...orderedCoords.slice(nearestSeg + 1)];
+    } else {
+      aheadCoords = orderedCoords;
     }
 
-    // Viewport: fit all stops + van + drops
-    const allCoords = [...pickupCoords, ...dropCoords, ...(vanCoord ? [vanCoord] : [])];
+    // Viewport
+    const allCoords = [
+      ...passengerStops.map(s => s.coordinate),
+      ...(destCoord ? [destCoord] : []),
+      ...(vanCoord ? [vanCoord] : []),
+    ];
     const initialRegion = vanCoord
-      ? { latitude:vanCoord.latitude, longitude:vanCoord.longitude, latitudeDelta:0.04, longitudeDelta:0.04 }
+      ? { latitude: vanCoord.latitude, longitude: vanCoord.longitude, latitudeDelta: 0.04, longitudeDelta: 0.04 }
       : fitRegion(allCoords);
 
     return (
@@ -1249,7 +1332,7 @@ export default function PassengerDashboard({ navigation }) {
             </View>
           </LinearGradient>
 
-          <View style={{ height:260, overflow:"hidden", borderBottomLeftRadius:16, borderBottomRightRadius:16 }}>
+          <View style={{ height:300, overflow:"hidden", borderBottomLeftRadius:16, borderBottomRightRadius:16 }}>
             <MapView
               ref={mapRef}
               provider={PROVIDER_GOOGLE}
@@ -1261,92 +1344,135 @@ export default function PassengerDashboard({ navigation }) {
               showsCompass={true}
               mapType="standard"
             >
-              {/* ── Full route polyline — SOLID, same as driver map ── */}
-              {/* Covers: driver home → pickups → drop-offs */}
-              {fullPolyline.length > 1 && (
+              {/* ── COVERED path — dotted grey (van already passed this) ── */}
+              {coveredCoords.length > 1 && (
                 <Polyline
-                  coordinates={fullPolyline}
+                  coordinates={coveredCoords}
+                  strokeColor="#9E9E9E"
+                  strokeWidth={4}
+                  lineDashPattern={[6, 8]}
+                />
+              )}
+
+              {/* ── AHEAD path — solid green (van still needs to go here) ── */}
+              {aheadCoords.length > 1 && (
+                <Polyline
+                  coordinates={aheadCoords}
                   strokeColor={C.main}
                   strokeWidth={5}
                 />
               )}
 
-              {/* ── Drop-off pins — one per passenger destination ── */}
-              {dropStops.length > 0 ? dropStops.map(drop => (
-                <Marker
-                  key={drop.key}
-                  coordinate={drop.coordinate}
-                  anchor={{ x:0.5, y:1 }}
-                  title={`Drop: ${drop.passengerName}`}
-                  description={drop.destination}
-                  zIndex={drop.isMyDrop ? 15 : 2}
-                >
-                  <View style={{ alignItems:'center' }}>
-                    <View style={[ds.destPin, { backgroundColor: drop.isMyDrop ? '#DC2626' : '#EF4444' }]}>
-                      <Icon name="flag" size={14} color="#fff" />
-                    </View>
-                    {drop.isMyDrop && (
-                      <View style={{ backgroundColor:'#DC2626', paddingHorizontal:5, paddingVertical:2, borderRadius:4, marginTop:2 }}>
-                        <Text style={{ color:'#fff', fontSize:8, fontWeight:'900' }}>YOUR DROP</Text>
-                      </View>
-                    )}
+              {/* ── Driver START marker ── */}
+              <Marker
+                coordinate={driverStartCoord}
+                anchor={{ x:0.5, y:0.5 }}
+                title="Driver Start"
+                description={driverInfo.name || "Driver"}
+                zIndex={5}
+              >
+                <View style={{ alignItems:'center' }}>
+                  <View style={{ backgroundColor:'#1565C0', padding:6, borderRadius:12, borderWidth:2, borderColor:'#fff' }}>
+                    <Icon name="home" size={13} color="#fff" />
                   </View>
-                </Marker>
-              )) : (
-                // Fallback: single route destination
-                assignedRoute.destinationLat && assignedRoute.destinationLng && (
-                  <Marker
-                    coordinate={{ latitude:assignedRoute.destinationLat, longitude:assignedRoute.destinationLng }}
-                    anchor={{ x:0.5, y:1 }}
-                    title="Destination"
-                    description={assignedRoute.destination || "Final Stop"}
-                  >
-                    <View style={ds.destPin}>
-                      <Icon name="flag" size={16} color="#fff" />
-                    </View>
-                  </Marker>
-                )
-              )}
+                  <View style={{ backgroundColor:'#1565C0', paddingHorizontal:5, paddingVertical:2, borderRadius:4, marginTop:2 }}>
+                    <Text style={{ color:'#fff', fontSize:8, fontWeight:'900' }}>START</Text>
+                  </View>
+                </View>
+              </Marker>
 
-              {/* Numbered stop markers for ALL passengers (same as driver view) */}
-              {stops.map((st, i) => {
-                const isMyStop = i === myStopIndex;
-                const bg = isMyStop ? C.amber : stopBg(allPassengers[i]?.status || 'pending');
+              {/* ── Passenger pickup markers: numbered + name + address ── */}
+              {passengerStops.map((st, i) => {
+                const isPicked  = st.status === 'picked';
+                const isMissed  = st.status === 'missed';
+                const bg = st.isMe ? C.amber : isPicked ? C.main : isMissed ? '#EF4444' : '#64748B';
                 return (
                   <Marker
-                    key={st._id}
+                    key={`pax-${st.passengerId || i}`}
                     coordinate={st.coordinate}
-                    anchor={{ x:0.5, y:0.5 }}
-                    title={st.passengerName}
-                    description={`Stop ${i + 1}: ${st.name}`}
-                    zIndex={isMyStop ? 10 : 1}
+                    anchor={{ x:0.5, y:1 }}
+                    title={st.name}
+                    description={st.address}
+                    zIndex={st.isMe ? 12 : isPicked ? 3 : 4}
                   >
                     <View style={{ alignItems:'center' }}>
-                      {isMyStop ? (
-                        // "YOU" callout for passenger's own stop
-                        <View style={{ alignItems:'center' }}>
-                          <View style={{ backgroundColor:C.amber, paddingHorizontal:8, paddingVertical:4, borderRadius:8, borderWidth:2, borderColor:'#fff' }}>
-                            <Text style={{ color:'#fff', fontWeight:'900', fontSize:11 }}>YOU</Text>
-                          </View>
-                          <View style={{ width:0, height:0, borderLeftWidth:6, borderRightWidth:6, borderTopWidth:6, borderLeftColor:'transparent', borderRightColor:'transparent', borderTopColor:C.amber }} />
-                        </View>
-                      ) : (
-                        <View style={[ds.stopPin, { backgroundColor:bg }]}>
-                          <Text style={{ color:'#fff', fontWeight:'900', fontSize:10 }}>{i + 1}</Text>
-                        </View>
-                      )}
+                      {/* Name + address callout label */}
+                      <View style={{
+                        backgroundColor: st.isMe ? C.amber : bg,
+                        paddingHorizontal: 7, paddingVertical: 4,
+                        borderRadius: 8, borderWidth: 1.5,
+                        borderColor: '#fff', maxWidth: 120,
+                        alignItems: 'center',
+                        shadowColor:'#000', shadowOffset:{width:0,height:1},
+                        shadowOpacity:0.25, shadowRadius:2, elevation:4,
+                      }}>
+                        {st.isMe ? (
+                          <Text style={{ color:'#fff', fontWeight:'900', fontSize:11 }}>YOU 📍</Text>
+                        ) : (
+                          <>
+                            <Text style={{ color:'#fff', fontWeight:'800', fontSize:10 }} numberOfLines={1}>
+                              {`P${i + 1}: ${st.name}`}
+                            </Text>
+                            <Text style={{ color:'rgba(255,255,255,0.85)', fontSize:8 }} numberOfLines={1}>
+                              {st.address}
+                            </Text>
+                          </>
+                        )}
+                      </View>
+                      {/* Triangle pointer */}
+                      <View style={{
+                        width:0, height:0,
+                        borderLeftWidth:6, borderRightWidth:6, borderTopWidth:7,
+                        borderLeftColor:'transparent', borderRightColor:'transparent',
+                        borderTopColor: st.isMe ? C.amber : bg,
+                      }} />
+                      {/* Status tick / number circle */}
+                      <View style={{
+                        width:20, height:20, borderRadius:10,
+                        backgroundColor: bg,
+                        alignItems:'center', justifyContent:'center',
+                        borderWidth:1.5, borderColor:'#fff', marginTop:1,
+                      }}>
+                        {isPicked
+                          ? <Icon name="checkmark" size={12} color="#fff" />
+                          : isMissed
+                          ? <Icon name="close"     size={12} color="#fff" />
+                          : <Text style={{ color:'#fff', fontWeight:'900', fontSize:9 }}>{i + 1}</Text>
+                        }
+                      </View>
                     </View>
                   </Marker>
                 );
               })}
 
-              {/* Live van marker — animated pulse */}
+              {/* ── Destination marker ── */}
+              {destCoord && (
+                <Marker
+                  coordinate={destCoord}
+                  anchor={{ x:0.5, y:1 }}
+                  title="Destination"
+                  description={assignedRoute.destination || "Final Stop"}
+                  zIndex={6}
+                >
+                  <View style={{ alignItems:'center' }}>
+                    <View style={{ backgroundColor:'#DC2626', paddingHorizontal:8, paddingVertical:4, borderRadius:8, borderWidth:1.5, borderColor:'#fff' }}>
+                      <Text style={{ color:'#fff', fontWeight:'900', fontSize:10 }}>🏁 DEST</Text>
+                    </View>
+                    <View style={{ width:0, height:0, borderLeftWidth:6, borderRightWidth:6, borderTopWidth:7, borderLeftColor:'transparent', borderRightColor:'transparent', borderTopColor:'#DC2626' }} />
+                    <View style={ds.destPin}>
+                      <Icon name="flag" size={14} color="#fff" />
+                    </View>
+                  </View>
+                </Marker>
+              )}
+
+              {/* ── Live van marker — animated pulse ── */}
               {vanCoord && (
                 <Marker
                   coordinate={vanCoord}
                   anchor={{ x:0.5, y:0.5 }}
-                  title="Van"
-                  description={driverInfo.name}
+                  title={`Van — ${driverInfo.name}`}
+                  description={driverInfo.vehicleNumber || ""}
                   zIndex={20}
                 >
                   <Animated.View style={{ transform:[{ scale:vanPulse }] }}>
