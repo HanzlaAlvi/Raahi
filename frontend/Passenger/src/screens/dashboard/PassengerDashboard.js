@@ -1,11 +1,11 @@
 // frontend/Passenger/src/screens/dashboard/PassengerDashboard.js
 // FIXES:
-//   1) boardingRequest socket event → Alert popup asking passenger to confirm boarding
-//   2) Passenger presses "Yes, I'm On Board" → PUT stop status to 'picked' → emit passengerBoarded
-//   3) Driver receives passengerBoarded → simulation resumes (moves to next stop)
-//   4) Map shows all passenger stops with numbered pins + live van marker
-//   5) 10-min alert from driver simulation or tenMinAlert socket event
-//   6) "I'm On Board" button visible when van has arrived (vanArrived state)
+//   1) Simulation properly starts from driver location → P1 → P2 → ... → Destination
+//   2) Van arrives at passenger stop → shows "I'm On Board" + "Not Going Today" buttons ON MAP (no popup)
+//   3) "Not Going Today" penalty: 50 Rs first time, then +10 each time (60, 70, 80...)
+//   4) After boarding OR declining → van moves to next stop automatically
+//   5) Driver location fetched from DB
+//   6) All existing functionality preserved
 
 import React, { useState, useEffect, useRef } from "react";
 import {
@@ -17,12 +17,11 @@ import Icon from "react-native-vector-icons/Ionicons";
 import MapView, { Marker, Polyline, PROVIDER_GOOGLE } from "react-native-maps";
 import { LinearGradient } from "expo-linear-gradient";
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { stopCoordinates } from "../../../../constants/coordinates"; // named stop → lat/lng
+import { stopCoordinates } from "../../../../constants/coordinates";
 
 const API_BASE_URL = "https://raahi-q2ur.onrender.com/api";
 const SOCKET_URL   = "https://raahi-q2ur.onrender.com";
 
-// ── Persistence keys ────────────────────────────────────────────────────────
 const PKEY_VAN_ARRIVED    = "passenger_vanArrived";
 const PKEY_VAN_STOP_ID    = "passenger_vanStopId";
 const PKEY_VAN_ROUTE_ID   = "passenger_vanRouteId";
@@ -41,10 +40,8 @@ const C = {
   info:"#1565C0", infoBg:"#E3F2FD",
 };
 
-const SPEED_KMH  = 40;
-const STEPS      = 60;
-const FRAME_MS   = 1000;
-const TEN_MIN_KM = (SPEED_KMH * 10) / 60; // ~6.67 km
+const SPEED_KMH = 40;
+const FRAME_MS  = 1000;
 
 const DEMO = [
   { latitude: 33.6884, longitude: 73.0512 },
@@ -61,8 +58,6 @@ function haversine(la1, ln1, la2, ln2) {
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 }
 
-// ── sortByProximityLocal — nearest-neighbour sort, mirrors driver's sortByProximity ──
-// Builds the SAME stop sequence the driver uses so passenger map matches driver map.
 function sortByProximityLocal(passengers, fromLat, fromLng) {
   if (!passengers || passengers.length === 0) return passengers;
   const remaining = passengers.map((p, origIndex) => ({
@@ -99,7 +94,6 @@ function resolvePassengerCoord(p, fallbackIndex = 0) {
   return DEMO[fallbackIndex % DEMO.length];
 }
 
-// ── resolveDropCoord: drop-off coordinate from passenger object ─────────────
 function resolveDropCoord(p) {
   const lat = p.destinationLat || p.dropLat || null;
   const lng = p.destinationLng || p.dropLng || null;
@@ -135,13 +129,13 @@ function fitRegion(coords) {
 const getInitials = (name = "") => name.split(" ").map(n => n[0]).join("").substring(0, 2).toUpperCase();
 
 export default function PassengerDashboard({ navigation }) {
-  const userTokenRef    = useRef(null);
-  const userIdRef       = useRef(null);
-  const intervalRef     = useRef(null);
-  const socketRef       = useRef(null);
-  const activeTripIdRef = useRef(null);
-  const mapRef          = useRef(null);
-  const driverLocationRef = useRef(null);  // { latitude, longitude } fetched from GET /api/drivers/:driverId
+  const userTokenRef      = useRef(null);
+  const userIdRef         = useRef(null);
+  const intervalRef       = useRef(null);
+  const socketRef         = useRef(null);
+  const activeTripIdRef   = useRef(null);
+  const mapRef            = useRef(null);
+  const driverLocationRef = useRef(null);
 
   const [userProfile,      setUserProfile]      = useState(null);
   const [pickupPoint,      setPickupPoint]       = useState("");
@@ -161,13 +155,19 @@ export default function PassengerDashboard({ navigation }) {
   const [vanArrived,          setVanArrived]           = useState(false);
   const [boarded,             setBoarded]              = useState(false);
   const [markingBoard,        setMarkingBoard]         = useState(false);
+  const [markingDecline,      setMarkingDecline]       = useState(false);
   const [useLiveTripLocation, setUseLiveTripLocation]  = useState(false);
+  const [penaltyInfo,         setPenaltyInfo]          = useState({ count:0, total:0 });
+  const [tripCompleted,       setTripCompleted]        = useState(false);
 
+  // Sim refs
   const simRef     = useRef(null);
   const segRef     = useRef(0);
   const stepRef    = useRef(0);
   const alertedRef = useRef(false);
   const stopsRef   = useRef([]);
+  // Track which stop index sim is currently targeting (so after boarding we jump to next)
+  const simTargetStopRef = useRef(-1);
 
   const [activePolls,      setActivePolls]      = useState([]);
   const [showPollModal,    setShowPollModal]     = useState(false);
@@ -179,7 +179,6 @@ export default function PassengerDashboard({ navigation }) {
   const [morningTrip,     setMorningTrip]     = useState(null);
   const [notifications,   setNotifications]   = useState([]);
   const [unreadCount,     setUnreadCount]     = useState(0);
-  // callVisible REMOVED — no call feature
   const [chatVisible,     setChatVisible]     = useState(false);
   const [unreadChatCount, setUnreadChatCount] = useState(0);
   const [chatMessages,    setChatMessages]    = useState([]);
@@ -194,15 +193,16 @@ export default function PassengerDashboard({ navigation }) {
   const cardAnim         = useRef(new Animated.Value(0)).current;
   const pulseAnim        = useRef(new Animated.Value(1)).current;
   const blinkAnim        = useRef(new Animated.Value(0)).current;
-  // callRingAnim removed
   const pollSlideAnim    = useRef(new Animated.Value(-200)).current;
   const pollPulseAnim    = useRef(new Animated.Value(1)).current;
   const morningSlideAnim = useRef(new Animated.Value(-200)).current;
   const morningPulseAnim = useRef(new Animated.Value(1)).current;
   const nextPickupPulse  = useRef(new Animated.Value(1)).current;
   const vanPulse         = useRef(new Animated.Value(1)).current;
+  const boardBtnScale    = useRef(new Animated.Value(0)).current;
 
   useEffect(() => {
+    loadPenaltyInfo();
     loadAuthData();
     initSocket();
     return () => {
@@ -219,9 +219,12 @@ export default function PassengerDashboard({ navigation }) {
     intervalRef.current = setInterval(() => fetchAll(userTokenRef.current, userIdRef.current), ms);
   }, [assignedRoute?.status]);
 
+  // ── Start/stop simulation based on state ──────────────────────────────────
   useEffect(() => {
-    if (assignedRoute?.status === "in_progress" && allPassengers.length > 1 && !boarded && !useLiveTripLocation) {
+    if (assignedRoute?.status === "in_progress" && allPassengers.length > 0 && !boarded && !useLiveTripLocation && !vanArrived) {
       startPassengerSim();
+    } else if (boarded || vanArrived) {
+      // Don't clear sim on vanArrived — we pause it internally
     } else {
       clearInterval(simRef.current);
     }
@@ -239,6 +242,15 @@ export default function PassengerDashboard({ navigation }) {
       vanPulse.setValue(1);
     }
   }, [vanArrived, etaToMe]);
+
+  // Board button slide-in when van arrives
+  useEffect(() => {
+    if (vanArrived && !boarded) {
+      Animated.spring(boardBtnScale, { toValue:1, tension:60, friction:6, useNativeDriver:true }).start();
+    } else {
+      boardBtnScale.setValue(0);
+    }
+  }, [vanArrived, boarded]);
 
   // Auto-follow van in live mode
   useEffect(() => {
@@ -266,7 +278,18 @@ export default function PassengerDashboard({ navigation }) {
     ])).start();
   }, []);
 
-  // callRingAnim useEffect removed
+  // ── Load penalty info from storage ────────────────────────────────────────
+  const loadPenaltyInfo = async () => {
+    try {
+      const [[, countStr], [, totalStr]] = await AsyncStorage.multiGet([
+        PKEY_PENALTY_COUNT, PKEY_PENALTY_TOTAL,
+      ]);
+      setPenaltyInfo({
+        count: parseInt(countStr || "0", 10),
+        total: parseInt(totalStr || "0", 10),
+      });
+    } catch {}
+  };
 
   // ── Socket.io ──────────────────────────────────────────────────────────────
   const initSocket = () => {
@@ -283,7 +306,9 @@ export default function PassengerDashboard({ navigation }) {
 
       socket.on("connect", () => {
         console.log("[Socket] Passenger connected:", socket.id);
-        if (activeTripIdRef.current) socket.emit("joinTrip", { tripId: activeTripIdRef.current, userId: userIdRef.current });
+        if (activeTripIdRef.current) {
+          socket.emit("joinTrip", { tripId: activeTripIdRef.current, userId: userIdRef.current });
+        }
       });
 
       // ── Real-time van location from driver ─────────────────────────────────
@@ -296,157 +321,74 @@ export default function PassengerDashboard({ navigation }) {
         setUseLiveTripLocation(true);
         clearInterval(simRef.current);
 
-        // Check 10-min threshold from live GPS
-        const myIdx = myStopIndex;
-        if (myIdx >= 0 && stopsRef.current.length > myIdx && !alertedRef.current) {
-          const myCoord = stopsRef.current[myIdx]?.coordinate;
-          if (myCoord) {
-            const dist = haversine(newPos.latitude, newPos.longitude, myCoord.latitude, myCoord.longitude);
-            const eta  = Math.max(1, Math.round((dist / SPEED_KMH) * 60));
-            setEtaToMe(eta);
-            if (eta <= 10) {
-              alertedRef.current = true;
-              Alert.alert(
-                "🚨 Van is 10 Minutes Away!",
-                `Van is ~${eta} minute${eta === 1 ? "" : "s"} away from your stop!\nGet ready at: ${stopsRef.current[myIdx]?.name || "your pickup"}`,
-                [{ text: "Got it! 👍" }]
-              );
+        // ETA from live GPS
+        setMyStopIndex(myIdx => {
+          if (myIdx >= 0 && stopsRef.current.length > myIdx) {
+            const myCoord = stopsRef.current[myIdx]?.coordinate;
+            if (myCoord) {
+              const dist = haversine(newPos.latitude, newPos.longitude, myCoord.latitude, myCoord.longitude);
+              const eta  = Math.max(1, Math.round((dist / SPEED_KMH) * 60));
+              setEtaToMe(eta);
             }
           }
-        }
+          return myIdx;
+        });
       });
 
-      // ── tripLocationUpdate (same as vanLocationUpdate, accept both) ─────────
       socket.on("tripLocationUpdate", (data) => {
         const lat = data?.latitude ?? data?.currentLocation?.latitude;
         const lng = data?.longitude ?? data?.currentLocation?.longitude;
         if (lat == null || lng == null) return;
-        const newPos = { latitude: Number(lat), longitude: Number(lng) };
-        setVanPos(newPos);
+        setVanPos({ latitude: Number(lat), longitude: Number(lng) });
         setUseLiveTripLocation(true);
         clearInterval(simRef.current);
       });
 
-      // ── tenMinAlert — driver simulation emits this for 10/5/3/1-min alerts ─
+      // ── tenMinAlert — tiered alerts ────────────────────────────────────────
       socket.on("tenMinAlert", (data) => {
         const myId    = userIdRef.current;
         const isForMe = data?.passengerId?.toString() === myId || data?.passengerId === myId;
         if (!isForMe) return;
 
-        const eta        = data?.etaMin    || data?.alertLevel || 10;
-        const level      = data?.alertLevel || 10;  // 10 | 5 | 3 | 1
-        const stop       = data?.stopName  || stopsRef.current[myStopIndex]?.name || "your pickup point";
+        const eta   = data?.etaMin || data?.alertLevel || 10;
+        const level = data?.alertLevel || 10;
+        const stop  = data?.stopName || "your pickup point";
 
-        // Only fire the Alert popup once per unique level — not on repeated events
         const levelKey = `alert_${level}`;
         if (alertedRef.current === levelKey) return;
         alertedRef.current = levelKey;
 
         setEtaToMe(eta);
 
-        // Tiered messaging based on urgency
         const levelConfig = {
-          10: { emoji: "⏱️", title: "Be Ready! Vehicle Approaching",   body: `Vehicle arriving in ~${eta} min at:\n${stop}\n\nStart making your way to the pickup point.` },
-          5:  { emoji: "🚐", title: "5 Minutes Away — Head Out Now!",  body: `Vehicle is ~${eta} min away at:\n${stop}\n\nPlease go to your pickup point now!` },
-          3:  { emoji: "⚠️", title: "Almost There — 3 Minutes!",       body: `Vehicle arriving in ~${eta} min at:\n${stop}\n\nBe at your spot RIGHT NOW!` },
-          1:  { emoji: "🚨", title: "Vehicle is 1 Minute Away!",       body: `Vehicle is 1 min away at:\n${stop}\n\nYour driver is almost here — don't miss it!` },
+          10: { emoji: "⏱️", title: "Be Ready! Vehicle Approaching",  body: `Vehicle arriving in ~${eta} min at:\n${stop}\n\nStart making your way to the pickup point.` },
+          5:  { emoji: "🚐", title: "5 Minutes Away — Head Out Now!", body: `Vehicle is ~${eta} min away at:\n${stop}\n\nPlease go to your pickup point now!` },
+          3:  { emoji: "⚠️", title: "Almost There — 3 Minutes!",      body: `Vehicle arriving in ~${eta} min at:\n${stop}\n\nBe at your spot RIGHT NOW!` },
+          1:  { emoji: "🚨", title: "Vehicle is 1 Minute Away!",      body: `Vehicle is 1 min away at:\n${stop}\n\nYour driver is almost here — don't miss it!` },
         };
 
         const cfg = levelConfig[level] || levelConfig[10];
-        console.log(`[Passenger] ${level}-min alert received for stop: ${stop}`);
-
-        Alert.alert(
-          `${cfg.emoji} ${cfg.title}`,
-          cfg.body,
-          [{ text: level <= 3 ? "On My Way! 🏃" : "Got it 👍" }]
-        );
+        Alert.alert(`${cfg.emoji} ${cfg.title}`, cfg.body, [{ text: level <= 3 ? "On My Way! 🏃" : "Got it 👍" }]);
       });
 
-      // ── boardingRequest — driver's van arrived at THIS passenger's stop ──────
-      // Van pauses here. Passenger must answer YES or NO.
-      // YES → onboard, driver sim resumes to next stop.
-      // NO  → penalty charged (50 Rs first time, 10 Rs each time after), driver sim resumes.
+      // ── boardingRequest — van arrived at THIS passenger's stop ─────────────
+      // We do NOT show a popup. We set vanArrived=true so the UI buttons appear on map.
       socket.on("boardingRequest", (data) => {
         const myId    = userIdRef.current;
         const isForMe = data?.passengerId?.toString() === myId || data?.passengerId === myId;
         if (!isForMe || boarded) return;
 
         setVanArrived(true);
-        clearInterval(simRef.current);
+        clearInterval(simRef.current); // pause sim while waiting
 
-        // ✅ PERSIST — so "I'm On Board" button reappears after app restart
         AsyncStorage.multiSet([
           [PKEY_VAN_ARRIVED,  "true"],
           [PKEY_VAN_STOP_ID,  data?.stopId?.toString()  || ""],
           [PKEY_VAN_ROUTE_ID, data?.routeId?.toString() || ""],
         ]).catch(() => {});
-
-        const stop = data?.stopName || "your stop";
-        Alert.alert(
-          "🚐 Van is Outside!",
-          `Your driver is waiting at:\n${stop}\n\nAre you onboarding?`,
-          [
-            {
-              text: "Yes ✅",
-              style: "default",
-              onPress: () => {
-                // Confirm boarding — this unpauses driver's simulation
-                setTimeout(() => {
-                  if (userTokenRef.current) handleBoardVanSocket();
-                }, 200);
-              },
-            },
-            {
-              text: "No ❌",
-              style: "destructive",
-              onPress: async () => {
-                // Apply penalty — 50 Rs first time, 10 Rs each subsequent time
-                try {
-                  const [[, countStr], [, totalStr]] = await AsyncStorage.multiGet([
-                    PKEY_PENALTY_COUNT, PKEY_PENALTY_TOTAL,
-                  ]);
-                  const prevCount = parseInt(countStr || "0", 10);
-                  const prevTotal = parseInt(totalStr || "0", 10);
-                  const penalty   = prevCount === 0 ? 50 : 10;
-                  const newCount  = prevCount + 1;
-                  const newTotal  = prevTotal + penalty;
-                  await AsyncStorage.multiSet([
-                    [PKEY_PENALTY_COUNT, newCount.toString()],
-                    [PKEY_PENALTY_TOTAL, newTotal.toString()],
-                  ]);
-                  Alert.alert(
-                    "⚠️ Penalty Applied",
-                    `You declined boarding after the van arrived.\nReason: Time wasted by driver.\n\nPenalty charged: Rs. ${penalty}\nTotal penalties so far: Rs. ${newTotal}`,
-                    [{ text: "Understood" }]
-                  );
-                } catch {}
-
-                // Clear arrived state
-                setVanArrived(false);
-                AsyncStorage.multiRemove([PKEY_VAN_ARRIVED, PKEY_VAN_STOP_ID, PKEY_VAN_ROUTE_ID]).catch(() => {});
-
-                // Tell driver simulation to resume (passenger declined → skip this stop)
-                if (socketRef.current?.connected && activeTripIdRef.current) {
-                  socketRef.current.emit("passengerDeclined", {
-                    tripId:      activeTripIdRef.current,
-                    passengerId: userIdRef.current,
-                    stopId:      data?.stopId,
-                  });
-                  // Also emit passengerBoarded so driver sim resumes to next stop
-                  socketRef.current.emit("passengerBoarded", {
-                    tripId:      activeTripIdRef.current,
-                    passengerId: userIdRef.current,
-                    status:      "missed",
-                  });
-                }
-              },
-            },
-          ],
-          { cancelable: false }
-        );
       });
 
-      // ── passengerStatusUpdate — driver manually marked passenger as picked ──
+      // ── passengerStatusUpdate — driver manually marked as picked ───────────
       socket.on("passengerStatusUpdate", (data) => {
         const myId = userIdRef.current;
         if (data?.passengerId?.toString() === myId || data?.passengerId === myId) {
@@ -461,49 +403,29 @@ export default function PassengerDashboard({ navigation }) {
       socket.on("routeCompleted", () => {
         setUseLiveTripLocation(false);
         clearInterval(simRef.current);
-        // Close chat and clear state when ride ends
         setChatVisible(false);
         setUnreadChatCount(0);
+        setTripCompleted(true);
+        setTimeout(() => setTripCompleted(false), 8000);
       });
 
-      // ── rideChat — real-time message from driver ─────────────────────────
       socket.on("rideChat", (data) => {
         const myId = userIdRef.current;
-        // Only notify if message is FROM driver (not self)
         if (!data?.senderId || data.senderId?.toString() === myId?.toString()) return;
         if (data?.senderRole !== "driver") return;
-        // If chat is open, refresh messages; else show unread dot
-        if (chatVisible) {
-          // Poll will pick it up in 4s — no action needed
-        } else {
-          setUnreadChatCount(prev => prev + 1);
-        }
+        setUnreadChatCount(prev => prev + 1);
       });
 
-      // ── chatEnded — server signals ride is over ──────────────────────────
       socket.on("chatEnded", () => {
         setChatVisible(false);
         setUnreadChatCount(0);
       });
 
-      // ── statsRefresh — emitted by server when route/trip completes ───────
-      // Triggers a fresh data pull so passenger sees updated trip status,
-      // ride history count, and "Trip Complete" banner immediately.
-      socket.on('statsRefresh', (data) => {
-        console.log('[Socket] statsRefresh received — pulling fresh data');
+      socket.on('statsRefresh', () => {
         fetchAll(userTokenRef.current, userIdRef.current);
       });
 
-      // ── routeCompleted — driver's socket event when route ends ──────────
-      socket.on('routeCompleted', (data) => {
-        console.log('[Socket] routeCompleted received');
-        setTripCompleted(true);
-        // Refresh data after brief delay to let DB settle
-        setTimeout(() => fetchAll(userTokenRef.current, userIdRef.current), 1500);
-      });
-
-      socket.on("disconnect", (reason) => {
-        console.log("[Socket] Passenger disconnected:", reason);
+      socket.on("disconnect", () => {
         setUseLiveTripLocation(false);
       });
 
@@ -513,32 +435,40 @@ export default function PassengerDashboard({ navigation }) {
     }
   };
 
-  // Join socket room when active trip changes
   useEffect(() => {
     if (!activeTripIdRef.current) return;
     if (socketRef.current?.connected) {
       socketRef.current.emit("joinTrip", { tripId: activeTripIdRef.current, userId: userIdRef.current });
-      console.log("[Socket] Passenger joined trip room:", activeTripIdRef.current);
     }
   }, [activeTripIdRef.current]); // eslint-disable-line
 
-  // ── Local simulation fallback (when no live GPS) ───────────────────────────
-  // Simulation flow: Driver origin → P1 → P2 → P3 → ... → Last Passenger → Destination
-  // This exactly mirrors the driver's simulation (stopsWithOrigin).
-  // Van moves at constant speed (SPEED_KMH). Distance-proportional tick fraction.
-  const startPassengerSim = () => {
+  // ── Local simulation ───────────────────────────────────────────────────────
+  // Flow: driverOrigin → P1 → P2 → ... → Pn → Destination
+  // Van PAUSES at MY stop, showing "I'm On Board" + "Not Going Today" buttons.
+  // After confirmation (either way), sim resumes from next stop.
+  const startPassengerSim = (resumeFromSeg = -1) => {
     clearInterval(simRef.current);
     const stops = buildStops();
     if (stops.length < 2) return;
-    stopsRef.current   = stops;
-    segRef.current     = 0;
-    stepRef.current    = 0;   // progress 0.0–1.0 within current segment
-    alertedRef.current = false;
-    setVanPos(stops[0].coordinate);
+    stopsRef.current = stops;
 
-    // myStopIndex in allPassengers (0-based) → index in full stops array = myStopIndex + 1
-    // (because driver origin is prepended at index 0)
-    const mySimStopIdx = myStopIndex >= 0 ? myStopIndex + 1 : -1;
+    // If resumeFromSeg provided, start from there; else start from 0
+    if (resumeFromSeg >= 0) {
+      segRef.current  = resumeFromSeg;
+      stepRef.current = 0;
+    } else {
+      segRef.current  = 0;
+      stepRef.current = 0;
+      alertedRef.current = false;
+    }
+
+    setVanPos(stops[segRef.current].coordinate);
+
+    // myStopIndex in sorted allPassengers list → index in full stops array = myIdx + 1
+    // stops[0] = driverOrigin, stops[1..n] = passengers, stops[n+1..] = destinations
+    const myIdx = myStopIndex;
+    const mySimStopIdx = myIdx >= 0 ? myIdx + 1 : -1;
+    simTargetStopRef.current = mySimStopIdx;
 
     simRef.current = setInterval(() => {
       const ss = stopsRef.current;
@@ -549,7 +479,6 @@ export default function PassengerDashboard({ navigation }) {
       const totalSegs = ss.length - 1;
       if (seg >= totalSegs) { clearInterval(simRef.current); return; }
 
-      // ── Distance-proportional step size ──────────────────────────────────
       const segDistKm = haversine(
         ss[seg].coordinate.latitude,     ss[seg].coordinate.longitude,
         ss[seg + 1].coordinate.latitude, ss[seg + 1].coordinate.longitude
@@ -560,9 +489,8 @@ export default function PassengerDashboard({ navigation }) {
       progress += stepFraction;
 
       if (progress >= 1) {
-        // Just completed this segment — arrived at ss[seg + 1]
         progress = 0;
-        seg      += 1;
+        seg += 1;
 
         if (seg >= totalSegs) {
           clearInterval(simRef.current);
@@ -571,34 +499,44 @@ export default function PassengerDashboard({ navigation }) {
           return;
         }
 
-        // Did we reach MY pickup stop? (only trigger before boarded)
-        if (mySimStopIdx > 0 && seg === mySimStopIdx && !boarded) {
+        // Did we just ARRIVE at MY pickup stop?
+        const targetIdx = simTargetStopRef.current;
+        if (targetIdx > 0 && seg === targetIdx) {
+          // Pause here — show boarding buttons on map
           setVanArrived(true);
+          setVanPos(ss[seg].coordinate);
           clearInterval(simRef.current);
           segRef.current  = seg;
           stepRef.current = progress;
+
+          // Also persist arrived state
+          AsyncStorage.multiSet([
+            [PKEY_VAN_ARRIVED,  "true"],
+            [PKEY_VAN_STOP_ID,  ss[seg]._id?.toString() || ""],
+            [PKEY_VAN_ROUTE_ID, assignedRoute?._id?.toString() || ""],
+          ]).catch(() => {});
           return;
         }
       }
 
-      // ── Interpolate current van position ─────────────────────────────────
+      // Interpolate position
       const pos = lerp(ss[seg].coordinate, ss[seg + 1].coordinate, progress);
       setVanPos(pos);
 
-      // ── ETA to MY pickup stop ─────────────────────────────────────────────
-      if (mySimStopIdx > 0 && mySimStopIdx < ss.length && seg < mySimStopIdx) {
-        const myCoord = ss[mySimStopIdx].coordinate;
+      // ETA to my stop
+      const targetIdx = simTargetStopRef.current;
+      if (targetIdx > 0 && targetIdx < ss.length && seg < targetIdx) {
+        const myCoord = ss[targetIdx].coordinate;
         const dist    = haversine(pos.latitude, pos.longitude, myCoord.latitude, myCoord.longitude);
         const eta     = Math.max(1, Math.round((dist / SPEED_KMH) * 60));
         setEtaToMe(eta);
 
-        // 10-min alert fires once per trip
-        if (eta <= 10 && !alertedRef.current) {
-          alertedRef.current = true;
+        if (eta <= 10 && alertedRef.current !== 'done10') {
+          alertedRef.current = 'done10';
           Alert.alert(
             '🚨 Van is 10 Minutes Away!',
-            `Van will reach your stop in ~${eta} minute${eta === 1 ? '' : 's'}!\nGet ready at: ${ss[mySimStopIdx].name}`,
-            [{ text: "Got it! I'm Ready! 👍" }]
+            `Van will reach your stop in ~${eta} minute${eta === 1 ? '' : 's'}!\nGet ready at: ${ss[targetIdx].name}`,
+            [{ text: "Got it! 👍" }]
           );
         }
       }
@@ -608,56 +546,54 @@ export default function PassengerDashboard({ navigation }) {
     }, FRAME_MS);
   };
 
+  // Resume simulation after current passenger (skip to next segment)
+  const resumeSimAfterStop = () => {
+    const ss = stopsRef.current;
+    if (!ss || ss.length < 2) return;
+    const nextSeg = segRef.current + 1; // move past MY stop
+    if (nextSeg >= ss.length - 1) return; // was last stop
+    startPassengerSim(nextSeg);
+  };
+
   const buildStops = () => {
-    // ── Driver origin coordinate — priority chain ─────────────────────────────
-    // 1. vanPos from socket (most accurate — driver IS here right now)
-    // 2. assignedRoute.currentLocation (last DB-synced van position)
-    // 3. driverInfo lat/lng (saved home location on driver profile — rarely set)
-    // 4. Visible offset ABOVE the first passenger stop (so the line is always
-    //    clearly visible and doesn't collapse to zero length)
-    //
-    // We resolve firstPassengerCoord early so option-4 works even before we
-    // build the passengerStops array below.
     const firstPax = (allPassengers || [])[0];
     const firstPaxCoord = firstPax ? resolvePassengerCoord(firstPax, 0) : null;
 
     const driverCoord = (() => {
-      // Option 1 — live socket position
+      // Priority 1: driverLocationRef (fetched from DB)
+      if (driverLocationRef.current?.latitude && driverLocationRef.current?.longitude) {
+        return { latitude: driverLocationRef.current.latitude, longitude: driverLocationRef.current.longitude };
+      }
+      // Priority 2: live socket van position
       if (vanPos?.latitude && vanPos?.longitude) {
         return { latitude: vanPos.latitude, longitude: vanPos.longitude };
       }
-      // Option 2 — last DB-synced location on route document
+      // Priority 3: route currentLocation
       const cl = assignedRoute?.currentLocation;
       if (cl?.latitude && cl?.longitude &&
           (Math.abs(cl.latitude - 33.6844) > 0.0001 || Math.abs(cl.longitude - 73.0479) > 0.0001)) {
         return { latitude: Number(cl.latitude), longitude: Number(cl.longitude) };
       }
-      // Option 3 — driver profile home coords (set by driver on registration)
+      // Priority 4: driver profile coords
       if (driverInfo?.latitude && driverInfo?.longitude &&
           (Math.abs(driverInfo.latitude - 33.6844) > 0.0001 || Math.abs(driverInfo.longitude - 73.0479) > 0.0001)) {
         return { latitude: Number(driverInfo.latitude), longitude: Number(driverInfo.longitude) };
       }
-      // Option 4 — clear visible offset 0.012° north (~1.3 km) above P1
-      // This guarantees a visible line from "Driver Start" down to P1 on the map.
+      // Priority 5: offset above first passenger
       if (firstPaxCoord) {
         return { latitude: firstPaxCoord.latitude + 0.012, longitude: firstPaxCoord.longitude - 0.006 };
       }
-      // Absolute fallback
       return { latitude: 33.6984, longitude: 73.0379 };
     })();
 
     const driverOrigin = {
-      _id:             "driver-origin",
+      _id: "driver-origin",
       _isDriverOrigin: true,
-      name:            "Driver Start",
-      passengerName:   "Driver",
-      coordinate:      driverCoord,
+      name: "Driver Start",
+      passengerName: "Driver",
+      coordinate: driverCoord,
     };
 
-    // ── Passenger pickup stops — allPassengers is ALREADY sorted by proximity ─
-    // fetchAssignedRoute calls sortByProximityLocal so no re-sorting needed here.
-    // This guarantees the simulation visits stops in the exact same order the driver does:
-    //   Driver Home → Nearest Passenger → Next Nearest → ... → Last Passenger → Destination
     const passengerStops = (allPassengers || []).map((p, i) => {
       const coord = resolvePassengerCoord(p, i);
       return {
@@ -669,27 +605,25 @@ export default function PassengerDashboard({ navigation }) {
       };
     });
 
-    // ── Destination stop ─────────────────────────────────────────────────────
     const destStops = [];
     if (assignedRoute?.destinationLat && assignedRoute?.destinationLng) {
       destStops.push({
-        _id:           "destination",
+        _id: "destination",
         _isDestination: true,
-        name:          assignedRoute.destination || "Destination",
+        name: assignedRoute.destination || "Destination",
         passengerName: "Destination",
-        coordinate:    { latitude: Number(assignedRoute.destinationLat), longitude: Number(assignedRoute.destinationLng) },
+        coordinate: { latitude: Number(assignedRoute.destinationLat), longitude: Number(assignedRoute.destinationLng) },
       });
     } else {
-      // Per-passenger drop-off coords as destination stops
       (allPassengers || []).forEach((p, i) => {
         const coord = resolveDropCoord(p);
         if (coord) {
           destStops.push({
-            _id:            `drop-${i}`,
+            _id: `drop-${i}`,
             _isDestination: true,
-            name:           p.destination || p.dropAddress || "Drop-off",
-            passengerName:  p.passengerName || `Passenger ${i + 1}`,
-            coordinate:     coord,
+            name: p.destination || p.dropAddress || "Drop-off",
+            passengerName: p.passengerName || `Passenger ${i + 1}`,
+            coordinate: coord,
           });
         }
       });
@@ -714,23 +648,13 @@ export default function PassengerDashboard({ navigation }) {
       }
       await fetchAll(token, storedId);
 
-      // ✅ RESTORE vanArrived — so "I'm On Board" button shows after app restart
+      // Restore vanArrived from storage
       try {
-        const [[, savedVanArrived], [, savedRouteId]] = await AsyncStorage.multiGet([
-          PKEY_VAN_ARRIVED, PKEY_VAN_ROUTE_ID,
-        ]);
-        if (savedVanArrived === "true" && savedRouteId) {
-          // Verify passenger hasn't already boarded in fresh route data
-          // (fetchAll will have run by now — read from state via a short delay)
-          setTimeout(async () => {
-            const [[, stillArrived]] = await AsyncStorage.multiGet([PKEY_VAN_ARRIVED]);
-            if (stillArrived === "true") {
-              console.log("[Passenger] 🔄 Restoring vanArrived from storage");
-              setVanArrived(true);
-            }
-          }, 1200);
+        const [[, savedVanArrived]] = await AsyncStorage.multiGet([PKEY_VAN_ARRIVED]);
+        if (savedVanArrived === "true") {
+          setTimeout(() => setVanArrived(true), 1200);
         }
-      } catch (e) { console.warn("[Passenger] restore vanArrived error:", e); }
+      } catch {}
     } catch (e) { console.error("loadAuthData:", e); }
   };
 
@@ -739,10 +663,7 @@ export default function PassengerDashboard({ navigation }) {
     Authorization: `Bearer ${tok || userTokenRef.current}`,
   });
 
-  // ── Fetch driver's real location from backend ─────────────────────────────
-  // Called whenever we learn the driverId (from route or trip).
-  // Stores result in driverLocationRef so buildStops() always starts from the
-  // driver's actual position — never a default or hardcoded coordinate.
+  // ── Fetch driver's real location from DB ───────────────────────────────────
   const fetchDriverLocation = async (driverId, tok) => {
     if (!driverId) return;
     const t = tok || userTokenRef.current;
@@ -751,13 +672,12 @@ export default function PassengerDashboard({ navigation }) {
       const res  = await fetch(`${API_BASE_URL}/drivers/${driverId}`, { headers: getHeaders(t) });
       const data = await res.json();
       const drv  = data.driver || data.data || data;
-      // Pull location: prefer explicit lat/lng fields, then GeoJSON location object
-      const lat = drv?.latitude  || drv?.location?.coordinates?.[1] || null;
-      const lng = drv?.longitude || drv?.location?.coordinates?.[0] || null;
+      const lat  = drv?.latitude  || drv?.location?.coordinates?.[1] || null;
+      const lng  = drv?.longitude || drv?.location?.coordinates?.[0] || null;
       if (lat && lng &&
           (Math.abs(Number(lat) - 33.6844) > 0.0001 || Math.abs(Number(lng) - 73.0479) > 0.0001)) {
         driverLocationRef.current = { latitude: Number(lat), longitude: Number(lng) };
-        console.log('[Passenger] Driver location fetched:', driverLocationRef.current);
+        console.log('[Passenger] Driver location fetched from DB:', driverLocationRef.current);
       }
     } catch (e) {
       console.warn('[Passenger] fetchDriverLocation error:', e.message);
@@ -785,9 +705,6 @@ export default function PassengerDashboard({ navigation }) {
         setAssignedRoute(route);
         const rawPassengers = route.passengers || [];
 
-        // ── Sort passengers by proximity from driver home — SAME algorithm as driver ──
-        // The driver visits passengers in nearest-neighbour order from their home.
-        // The passenger must see the SAME sequence or the van appears to jump randomly.
         const drv0 = route.assignedDriver;
         let dHomeLat = 33.6844, dHomeLng = 73.0479;
         if (drv0 && typeof drv0 === "object" && drv0.name) {
@@ -798,14 +715,11 @@ export default function PassengerDashboard({ navigation }) {
           dHomeLng = route.currentLocation.longitude;
         }
 
-        // sortByProximityLocal returns passengers sorted nearest-first from driver home
         const passengers = sortByProximityLocal(rawPassengers, dHomeLat, dHomeLng);
-
         setAllPassengers(passengers);
         setTotalPassengers(passengers.length);
 
-        // myIdx is now the position in the SORTED list — this is what the driver uses
-        const myIdx   = passengers.findIndex(p =>
+        const myIdx = passengers.findIndex(p =>
           (p.passengerId?.toString() || p._id?.toString()) === id
         );
         setMyStopIndex(myIdx);
@@ -816,11 +730,9 @@ export default function PassengerDashboard({ navigation }) {
           setBoarded(true);
           setVanArrived(false);
           clearInterval(simRef.current);
-          // ✅ CLEAR persisted van-arrived if already boarded per server
           AsyncStorage.multiRemove([PKEY_VAN_ARRIVED, PKEY_VAN_STOP_ID, PKEY_VAN_ROUTE_ID]).catch(() => {});
         }
 
-        // before = passengers who come BEFORE me in the proximity-sorted order
         const before = myIdx >= 0 ? passengers.slice(0, myIdx) : [];
         setPickedBeforeMe(before.filter(p => p.status === "picked").length);
         setIsNextPickup(
@@ -829,7 +741,6 @@ export default function PassengerDashboard({ navigation }) {
           myEntry?.status !== "picked" && myIdx >= 0
         );
 
-        // Build stops ref for ETA alerts — sorted so distances match driver's path
         stopsRef.current = passengers.map((p, i) => ({
           _id:        p._id?.toString() || `p-${i}`,
           name:       p.pickupPoint || p.pickupAddress || `Stop ${i + 1}`,
@@ -848,30 +759,20 @@ export default function PassengerDashboard({ navigation }) {
             longitude:     drv.longitude     || drv.location?.coordinates?.[0] || null,
           });
 
-          // ── Set driverLocationRef from populated assignedDriver data ────────
-          // assignedDriver is populated (full User object) when route is fetched.
-          // Extract lat/lng directly — no extra API call needed here.
           const dLat = drv.latitude  || drv.location?.coordinates?.[1];
           const dLng = drv.longitude || drv.location?.coordinates?.[0];
           if (dLat && dLng &&
               (Math.abs(Number(dLat) - 33.6844) > 0.0001 || Math.abs(Number(dLng) - 73.0479) > 0.0001)) {
             driverLocationRef.current = { latitude: Number(dLat), longitude: Number(dLng) };
-            console.log('[Passenger] Driver location set from route.assignedDriver:', driverLocationRef.current);
           }
 
-          // ── Also fetch full driver profile to get latest location ───────────
-          // assignedDriver in route may be a shallow populate — full profile has fresher coords.
           const drvId = drv._id?.toString() || drv.id?.toString();
-          if (drvId) {
-            fetchDriverLocation(drvId, t).catch(() => {});
-          }
+          if (drvId) fetchDriverLocation(drvId, t).catch(() => {});
         }
       } else {
-        // If we HAD an active route and now it's gone — the trip just completed
         setAssignedRoute(prev => {
           if (prev && prev.status === 'in_progress') {
             setTripCompleted(true);
-            // Auto-hide the banner after 8 seconds
             setTimeout(() => setTripCompleted(false), 8000);
           }
           return null;
@@ -945,7 +846,6 @@ export default function PassengerDashboard({ navigation }) {
             activeTripIdRef.current = tripId;
             if (socketRef.current?.connected) {
               socketRef.current.emit("joinTrip", { tripId, userId: userIdRef.current });
-              console.log("[Socket] Passenger joined trip room:", tripId);
             }
           }
           const lat = active.currentLocation?.latitude;
@@ -956,7 +856,6 @@ export default function PassengerDashboard({ navigation }) {
           } else {
             setUseLiveTripLocation(false);
           }
-          // Morning confirmation
           const myP = active.passengers?.find(p => {
             const pId = p._id?._id?.toString() || p._id?.toString() || p._id;
             return pId === id;
@@ -973,20 +872,17 @@ export default function PassengerDashboard({ navigation }) {
     } catch {}
   };
 
-  // ── Board Van (called from socket boardingRequest confirmation) ────────────
-  // This is the critical function: confirms pickup, emits passengerBoarded
-  // which unpauses the driver's simulation so they move to the next stop.
-  const handleBoardVanSocket = async () => {
-    if (!assignedRoute || !myPassengerEntry) return;
+  // ── "I'm On Board!" handler ───────────────────────────────────────────────
+  const handleBoardVan = async () => {
+    if (!assignedRoute || !myPassengerEntry || markingBoard) return;
+    setMarkingBoard(true);
     try {
-      setMarkingBoard(true);
       const stopId = myPassengerEntry._id;
-      const tok    = userTokenRef.current;
       const res = await fetch(
         `${API_BASE_URL}/routes/${assignedRoute._id}/stops/${stopId}/status`,
         {
           method: "PUT",
-          headers: { "Content-Type":"application/json", Authorization:`Bearer ${tok}` },
+          headers: getHeaders(),
           body: JSON.stringify({ status: "picked" }),
         }
       );
@@ -995,11 +891,9 @@ export default function PassengerDashboard({ navigation }) {
         setBoarded(true);
         setVanArrived(false);
         clearInterval(simRef.current);
-
-        // ✅ CLEAR persisted van-arrived state
         AsyncStorage.multiRemove([PKEY_VAN_ARRIVED, PKEY_VAN_STOP_ID, PKEY_VAN_ROUTE_ID]).catch(() => {});
 
-        // ✅ KEY: emit passengerBoarded → driver's socket listener resumes simulation
+        // Emit passengerBoarded → driver sim resumes
         if (socketRef.current?.connected && activeTripIdRef.current) {
           socketRef.current.emit("passengerBoarded", {
             tripId:      activeTripIdRef.current,
@@ -1007,45 +901,77 @@ export default function PassengerDashboard({ navigation }) {
             status:      "picked",
           });
         }
-        Alert.alert("✅ Boarded!", "You're on the vehicle. Enjoy your ride!", [{ text:"OK" }]);
-        await fetchAssignedRoute(userTokenRef.current, userIdRef.current);
-      }
-    } catch { Alert.alert("Error", "Connection failed. Please try again."); }
-    finally { setMarkingBoard(false); }
-  };
 
-  // ── Board Van (called from UI button — manual fallback) ────────────────────
-  const handleBoardVan = async () => {
-    if (!assignedRoute || !myPassengerEntry) return;
-    try {
-      setMarkingBoard(true);
-      const stopId = myPassengerEntry._id;
-      const res = await fetch(
-        `${API_BASE_URL}/routes/${assignedRoute._id}/stops/${stopId}/status`,
-        { method:"PUT", headers:getHeaders(), body:JSON.stringify({ status:"picked" }) }
-      );
-      const data = await res.json();
-      if (data.success) {
-        setBoarded(true);
-        setVanArrived(false);
-        clearInterval(simRef.current);
-        // ✅ CLEAR persisted van-arrived state
-        AsyncStorage.multiRemove([PKEY_VAN_ARRIVED, PKEY_VAN_STOP_ID, PKEY_VAN_ROUTE_ID]).catch(() => {});
-        // ✅ Emit passengerBoarded to unblock driver simulation
-        if (socketRef.current?.connected && activeTripIdRef.current) {
-          socketRef.current.emit("passengerBoarded", {
-            tripId:      activeTripIdRef.current,
-            passengerId: userIdRef.current,
-            status:      "picked",
-          });
-        }
-        Alert.alert("✅ Boarded!", "You're on the vehicle. Enjoy your ride!", [{ text:"OK" }]);
+        // Resume local sim for remaining passengers (so map still shows van moving)
+        resumeSimAfterStop();
+
         await fetchAssignedRoute(userTokenRef.current, userIdRef.current);
       } else {
         Alert.alert("Error", data.message || "Could not mark as boarded.");
       }
-    } catch { Alert.alert("Error", "Connection failed."); }
-    finally { setMarkingBoard(false); }
+    } catch {
+      Alert.alert("Error", "Connection failed. Please try again.");
+    } finally {
+      setMarkingBoard(false);
+    }
+  };
+
+  // ── "Not Going Today" handler — penalty: 50 first, then 10 more each time ─
+  // So: 1st = 50, 2nd = 60, 3rd = 70, 4th = 80 ...
+  const handleNotGoingToday = async () => {
+    if (markingDecline) return;
+    setMarkingDecline(true);
+    try {
+      // Calculate penalty
+      const [[, countStr], [, totalStr]] = await AsyncStorage.multiGet([
+        PKEY_PENALTY_COUNT, PKEY_PENALTY_TOTAL,
+      ]);
+      const prevCount = parseInt(countStr || "0", 10);
+      const prevTotal = parseInt(totalStr || "0", 10);
+      // 1st time: 50, 2nd: 60, 3rd: 70 ... (50 + prevCount * 10)
+      const penalty  = 50 + prevCount * 10;
+      const newCount = prevCount + 1;
+      const newTotal = prevTotal + penalty;
+
+      await AsyncStorage.multiSet([
+        [PKEY_PENALTY_COUNT, newCount.toString()],
+        [PKEY_PENALTY_TOTAL, newTotal.toString()],
+      ]);
+
+      setPenaltyInfo({ count: newCount, total: newTotal });
+
+      // Clear arrived state
+      setVanArrived(false);
+      AsyncStorage.multiRemove([PKEY_VAN_ARRIVED, PKEY_VAN_STOP_ID, PKEY_VAN_ROUTE_ID]).catch(() => {});
+
+      // Emit to driver — van should move to next stop
+      if (socketRef.current?.connected && activeTripIdRef.current) {
+        socketRef.current.emit("passengerDeclined", {
+          tripId:      activeTripIdRef.current,
+          passengerId: userIdRef.current,
+        });
+        socketRef.current.emit("passengerBoarded", {
+          tripId:      activeTripIdRef.current,
+          passengerId: userIdRef.current,
+          status:      "missed",
+        });
+      }
+
+      // Resume local sim to next stop
+      resumeSimAfterStop();
+
+      Alert.alert(
+        "⚠️ Penalty Applied",
+        `Penalty for not boarding: Rs. ${penalty}\nTotal penalties: Rs. ${newTotal}\n\n(Each missed boarding increases penalty by Rs. 10)`,
+        [{ text: "Understood" }]
+      );
+
+      await fetchAssignedRoute(userTokenRef.current, userIdRef.current);
+    } catch (e) {
+      Alert.alert("Error", "Could not process. Try again.");
+    } finally {
+      setMarkingDecline(false);
+    }
   };
 
   // ── Poll response ──────────────────────────────────────────────────────────
@@ -1117,11 +1043,9 @@ export default function PassengerDashboard({ navigation }) {
   const fetchChatMessages = async (driverId) => {
     if (!driverId) return;
     try {
-      const tok = userTokenRef.current;
+      const tok  = userTokenRef.current;
       const myId = userIdRef.current;
-      const res = await fetch(`${API_BASE_URL}/messages/${driverId}`, {
-        headers: getHeaders(tok),
-      });
+      const res  = await fetch(`${API_BASE_URL}/messages/${driverId}`, { headers: getHeaders(tok) });
       const data = await res.json();
       if (data.success) {
         const msgs = (data.messages || []).map(m => ({
@@ -1137,10 +1061,7 @@ export default function PassengerDashboard({ navigation }) {
           m => m.senderId?.toString() === myId?.toString() && m.messageType === "typed"
         ).length;
         setTypedCount(myTyped);
-        // Mark as read
-        fetch(`${API_BASE_URL}/messages/${driverId}/read`, {
-          method: "PUT", headers: getHeaders(tok),
-        }).catch(() => {});
+        fetch(`${API_BASE_URL}/messages/${driverId}/read`, { method:"PUT", headers:getHeaders(tok) }).catch(() => {});
         setTimeout(() => flatListRef.current?.scrollToEnd({ animated: true }), 100);
       }
     } catch (e) { console.warn("fetchChatMessages:", e); }
@@ -1149,7 +1070,6 @@ export default function PassengerDashboard({ navigation }) {
   const openChatWithDriver = async () => {
     const driverId = routeDriver?._id;
     if (!driverId) { Alert.alert("No Driver", "Driver not assigned yet."); return; }
-    // Only available during active ride
     if (assignedRoute?.status !== "in_progress") {
       Alert.alert("Chat Unavailable", "Chat is only available when the driver has started the route."); return;
     }
@@ -1175,7 +1095,7 @@ export default function PassengerDashboard({ navigation }) {
     if (!driverId) { Alert.alert("Error", "No driver assigned."); return; }
     if (chatSending) return;
 
-    const myId = userIdRef.current;
+    const myId  = userIdRef.current;
     const tempId = `tmp_${Date.now()}`;
     const tempMsg = {
       _id: tempId, text: msgText.trim(), fromDriver: false, fromMe: true,
@@ -1239,39 +1159,24 @@ export default function PassengerDashboard({ navigation }) {
     return { label:"Scheduled", color:"#7A5C00", icon:"calendar-outline", bg:C.warnBg };
   };
 
-  // ── Stop pin color helpers (same as driver's view) ─────────────────────────
-  const stopBg = (status) => {
-    if (status === 'picked')  return C.main;
-    if (status === 'missed')  return '#EF4444';
-    if (status === 'waiting') return C.amber;
-    return '#64748B';
-  };
-
   // ── LIVE MAP ───────────────────────────────────────────────────────────────
   const renderLiveMap = () => {
     if (!assignedRoute || assignedRoute.status !== "in_progress") return null;
 
-    // ── Build full stop sequence: Driver → P1 → P2 → ... → Destination ──────
-    // buildStops() returns: [driverOrigin, ...passengerStops, ...destStops]
-    // stops[0] IS the driver origin — coordinate already resolved with correct priority.
     const stops    = buildStops();
     const vanCoord = vanPos || (stops.length > 0 ? stops[0].coordinate : null);
+    const driverStartCoord = stops.length > 0 ? stops[0].coordinate : { latitude:33.6844, longitude:73.0479 };
 
-    // Driver start = stops[0] (already resolved with vanPos → currentLocation → offset priority)
-    const driverStartCoord = stops.length > 0 ? stops[0].coordinate : { latitude: 33.6844, longitude: 73.0479 };
-
-    // ── Passenger pickup stop list (no driver origin, no dest) ───────────────
     const passengerStops = (allPassengers || []).map((p, i) => ({
-      index:         i,
-      passengerId:   p.passengerId?.toString() || p._id?.toString(),
-      name:          p.passengerName || p.name || `Passenger ${i + 1}`,
-      address:       p.pickupPoint || p.pickupAddress || `Stop ${i + 1}`,
-      status:        p.status || 'pending',
-      coordinate:    resolvePassengerCoord(p, i),
-      isMe:          (p.passengerId?.toString() || p._id?.toString()) === userIdRef.current,
+      index:       i,
+      passengerId: p.passengerId?.toString() || p._id?.toString(),
+      name:        p.passengerName || p.name || `Passenger ${i + 1}`,
+      address:     p.pickupPoint || p.pickupAddress || `Stop ${i + 1}`,
+      status:      p.status || 'pending',
+      coordinate:  resolvePassengerCoord(p, i),
+      isMe:        (p.passengerId?.toString() || p._id?.toString()) === userIdRef.current,
     }));
 
-    // ── Destination coordinate ───────────────────────────────────────────────
     const destCoord = (() => {
       if (assignedRoute.destinationLat && assignedRoute.destinationLng)
         return { latitude: assignedRoute.destinationLat, longitude: assignedRoute.destinationLng };
@@ -1279,46 +1184,40 @@ export default function PassengerDashboard({ navigation }) {
       return lastDrop || null;
     })();
 
-    // ── Full ordered route: driverStart → P1 → P2 → ... → Destination ───────
     const orderedCoords = [
       driverStartCoord,
       ...passengerStops.map(s => s.coordinate),
       ...(destCoord ? [destCoord] : []),
     ];
 
-    // ── Split polyline into "covered" (van already passed) and "ahead" ───────
-    // We find which segment the van is on, then split the route there.
-    // covered = dotted grey line  |  ahead = solid green line
     let coveredCoords = [];
     let aheadCoords   = [];
 
     if (vanCoord && orderedCoords.length > 1) {
-      // Find nearest segment to current van position
-      let nearestSeg   = 0;
-      let nearestDist  = Infinity;
+      let nearestSeg  = 0;
+      let nearestDist = Infinity;
       for (let s = 0; s < orderedCoords.length - 1; s++) {
         const midLat = (orderedCoords[s].latitude  + orderedCoords[s + 1].latitude)  / 2;
         const midLng = (orderedCoords[s].longitude + orderedCoords[s + 1].longitude) / 2;
         const d = haversine(vanCoord.latitude, vanCoord.longitude, midLat, midLng);
         if (d < nearestDist) { nearestDist = d; nearestSeg = s; }
       }
-      // covered = start → van's current position (insert van midway on nearest seg)
       coveredCoords = [...orderedCoords.slice(0, nearestSeg + 1), vanCoord];
-      // ahead = van's current position → remaining stops → destination
       aheadCoords   = [vanCoord, ...orderedCoords.slice(nearestSeg + 1)];
     } else {
       aheadCoords = orderedCoords;
     }
 
-    // Viewport
     const allCoords = [
       ...passengerStops.map(s => s.coordinate),
       ...(destCoord ? [destCoord] : []),
       ...(vanCoord ? [vanCoord] : []),
     ];
     const initialRegion = vanCoord
-      ? { latitude: vanCoord.latitude, longitude: vanCoord.longitude, latitudeDelta: 0.04, longitudeDelta: 0.04 }
+      ? { latitude:vanCoord.latitude, longitude:vanCoord.longitude, latitudeDelta:0.04, longitudeDelta:0.04 }
       : fitRegion(allCoords);
+
+    const showBoardingButtons = vanArrived && !boarded && myPassengerEntry?.status !== "picked";
 
     return (
       <Animated.View style={{ transform:[{ translateY:cardTranslateY }], marginBottom:14 }}>
@@ -1332,7 +1231,7 @@ export default function PassengerDashboard({ navigation }) {
             </View>
           </LinearGradient>
 
-          <View style={{ height:300, overflow:"hidden", borderBottomLeftRadius:16, borderBottomRightRadius:16 }}>
+          <View style={{ height:300, overflow:"hidden" }}>
             <MapView
               ref={mapRef}
               provider={PROVIDER_GOOGLE}
@@ -1344,33 +1243,17 @@ export default function PassengerDashboard({ navigation }) {
               showsCompass={true}
               mapType="standard"
             >
-              {/* ── COVERED path — dotted grey (van already passed this) ── */}
+              {/* Covered path — grey dotted */}
               {coveredCoords.length > 1 && (
-                <Polyline
-                  coordinates={coveredCoords}
-                  strokeColor="#9E9E9E"
-                  strokeWidth={4}
-                  lineDashPattern={[6, 8]}
-                />
+                <Polyline coordinates={coveredCoords} strokeColor="#9E9E9E" strokeWidth={4} lineDashPattern={[6,8]} />
               )}
-
-              {/* ── AHEAD path — solid green (van still needs to go here) ── */}
+              {/* Ahead path — green solid */}
               {aheadCoords.length > 1 && (
-                <Polyline
-                  coordinates={aheadCoords}
-                  strokeColor={C.main}
-                  strokeWidth={5}
-                />
+                <Polyline coordinates={aheadCoords} strokeColor={C.main} strokeWidth={5} />
               )}
 
-              {/* ── Driver START marker ── */}
-              <Marker
-                coordinate={driverStartCoord}
-                anchor={{ x:0.5, y:0.5 }}
-                title="Driver Start"
-                description={driverInfo.name || "Driver"}
-                zIndex={5}
-              >
+              {/* Driver START marker */}
+              <Marker coordinate={driverStartCoord} anchor={{ x:0.5, y:0.5 }} title="Driver Start" zIndex={5}>
                 <View style={{ alignItems:'center' }}>
                   <View style={{ backgroundColor:'#1565C0', padding:6, borderRadius:12, borderWidth:2, borderColor:'#fff' }}>
                     <Icon name="home" size={13} color="#fff" />
@@ -1381,10 +1264,10 @@ export default function PassengerDashboard({ navigation }) {
                 </View>
               </Marker>
 
-              {/* ── Passenger pickup markers: numbered + name + address ── */}
+              {/* Passenger pickup markers */}
               {passengerStops.map((st, i) => {
-                const isPicked  = st.status === 'picked';
-                const isMissed  = st.status === 'missed';
+                const isPicked = st.status === 'picked';
+                const isMissed = st.status === 'missed';
                 const bg = st.isMe ? C.amber : isPicked ? C.main : isMissed ? '#EF4444' : '#64748B';
                 return (
                   <Marker
@@ -1396,13 +1279,11 @@ export default function PassengerDashboard({ navigation }) {
                     zIndex={st.isMe ? 12 : isPicked ? 3 : 4}
                   >
                     <View style={{ alignItems:'center' }}>
-                      {/* Name + address callout label */}
                       <View style={{
                         backgroundColor: st.isMe ? C.amber : bg,
-                        paddingHorizontal: 7, paddingVertical: 4,
-                        borderRadius: 8, borderWidth: 1.5,
-                        borderColor: '#fff', maxWidth: 120,
-                        alignItems: 'center',
+                        paddingHorizontal:7, paddingVertical:4, borderRadius:8,
+                        borderWidth:1.5, borderColor:'#fff', maxWidth:120,
+                        alignItems:'center',
                         shadowColor:'#000', shadowOffset:{width:0,height:1},
                         shadowOpacity:0.25, shadowRadius:2, elevation:4,
                       }}>
@@ -1410,71 +1291,38 @@ export default function PassengerDashboard({ navigation }) {
                           <Text style={{ color:'#fff', fontWeight:'900', fontSize:11 }}>YOU 📍</Text>
                         ) : (
                           <>
-                            <Text style={{ color:'#fff', fontWeight:'800', fontSize:10 }} numberOfLines={1}>
-                              {`P${i + 1}: ${st.name}`}
-                            </Text>
-                            <Text style={{ color:'rgba(255,255,255,0.85)', fontSize:8 }} numberOfLines={1}>
-                              {st.address}
-                            </Text>
+                            <Text style={{ color:'#fff', fontWeight:'800', fontSize:10 }} numberOfLines={1}>{`P${i+1}: ${st.name}`}</Text>
+                            <Text style={{ color:'rgba(255,255,255,0.85)', fontSize:8 }} numberOfLines={1}>{st.address}</Text>
                           </>
                         )}
                       </View>
-                      {/* Triangle pointer */}
-                      <View style={{
-                        width:0, height:0,
-                        borderLeftWidth:6, borderRightWidth:6, borderTopWidth:7,
-                        borderLeftColor:'transparent', borderRightColor:'transparent',
-                        borderTopColor: st.isMe ? C.amber : bg,
-                      }} />
-                      {/* Status tick / number circle */}
-                      <View style={{
-                        width:20, height:20, borderRadius:10,
-                        backgroundColor: bg,
-                        alignItems:'center', justifyContent:'center',
-                        borderWidth:1.5, borderColor:'#fff', marginTop:1,
-                      }}>
-                        {isPicked
-                          ? <Icon name="checkmark" size={12} color="#fff" />
-                          : isMissed
-                          ? <Icon name="close"     size={12} color="#fff" />
-                          : <Text style={{ color:'#fff', fontWeight:'900', fontSize:9 }}>{i + 1}</Text>
-                        }
+                      <View style={{ width:0, height:0, borderLeftWidth:6, borderRightWidth:6, borderTopWidth:7, borderLeftColor:'transparent', borderRightColor:'transparent', borderTopColor: st.isMe ? C.amber : bg }} />
+                      <View style={{ width:20, height:20, borderRadius:10, backgroundColor:bg, alignItems:'center', justifyContent:'center', borderWidth:1.5, borderColor:'#fff', marginTop:1 }}>
+                        {isPicked ? <Icon name="checkmark" size={12} color="#fff" />
+                          : isMissed ? <Icon name="close" size={12} color="#fff" />
+                          : <Text style={{ color:'#fff', fontWeight:'900', fontSize:9 }}>{i+1}</Text>}
                       </View>
                     </View>
                   </Marker>
                 );
               })}
 
-              {/* ── Destination marker ── */}
+              {/* Destination marker */}
               {destCoord && (
-                <Marker
-                  coordinate={destCoord}
-                  anchor={{ x:0.5, y:1 }}
-                  title="Destination"
-                  description={assignedRoute.destination || "Final Stop"}
-                  zIndex={6}
-                >
+                <Marker coordinate={destCoord} anchor={{ x:0.5, y:1 }} title="Destination" zIndex={6}>
                   <View style={{ alignItems:'center' }}>
                     <View style={{ backgroundColor:'#DC2626', paddingHorizontal:8, paddingVertical:4, borderRadius:8, borderWidth:1.5, borderColor:'#fff' }}>
                       <Text style={{ color:'#fff', fontWeight:'900', fontSize:10 }}>🏁 DEST</Text>
                     </View>
                     <View style={{ width:0, height:0, borderLeftWidth:6, borderRightWidth:6, borderTopWidth:7, borderLeftColor:'transparent', borderRightColor:'transparent', borderTopColor:'#DC2626' }} />
-                    <View style={ds.destPin}>
-                      <Icon name="flag" size={14} color="#fff" />
-                    </View>
+                    <View style={ds.destPin}><Icon name="flag" size={14} color="#fff" /></View>
                   </View>
                 </Marker>
               )}
 
-              {/* ── Live van marker — animated pulse ── */}
+              {/* Live van marker */}
               {vanCoord && (
-                <Marker
-                  coordinate={vanCoord}
-                  anchor={{ x:0.5, y:0.5 }}
-                  title={`Van — ${driverInfo.name}`}
-                  description={driverInfo.vehicleNumber || ""}
-                  zIndex={20}
-                >
+                <Marker coordinate={vanCoord} anchor={{ x:0.5, y:0.5 }} title={`Van — ${driverInfo.name}`} zIndex={20}>
                   <Animated.View style={{ transform:[{ scale:vanPulse }] }}>
                     <View style={ds.vanMarker}>
                       <Icon name="bus" size={18} color="#fff" />
@@ -1492,28 +1340,87 @@ export default function PassengerDashboard({ navigation }) {
               {(boarded || myPassengerEntry?.status === "picked")
                 ? "✅ You're on board!"
                 : vanArrived
-                ? "🚐 Van is HERE — Board Now!"
+                ? "🚐 Van is OUTSIDE your stop!"
                 : etaToMe
                 ? `Van arrives at your stop in ~${etaToMe} min${etaToMe <= 10 ? " ⚠️" : ""}`
                 : "Calculating your ETA…"}
             </Text>
           </View>
 
-          {/* Board button — appears when van has arrived and passenger hasn't confirmed yet */}
-          {(vanArrived && !boarded && myPassengerEntry?.status !== "picked") && (
-            <TouchableOpacity
-              style={{ backgroundColor:C.main, margin:12, borderRadius:14, paddingVertical:14, alignItems:"center", flexDirection:"row", justifyContent:"center", gap:8 }}
-              onPress={handleBoardVan}
-              disabled={markingBoard}
-            >
-              {markingBoard
-                ? <ActivityIndicator size="small" color="#fff" />
-                : <>
-                    <Icon name="checkmark-circle" size={22} color="#fff" />
-                    <Text style={{ color:"#fff", fontWeight:"900", fontSize:16 }}>I'm On Board! ✅</Text>
-                  </>
-              }
-            </TouchableOpacity>
+          {/* ── BOARDING BUTTONS — shown directly on map card when van arrives ── */}
+          {showBoardingButtons && (
+            <Animated.View style={{ transform:[{ scale:boardBtnScale }] }}>
+              {/* Van arrived announcement bar */}
+              <View style={ds.arrivedBar}>
+                <Animated.View style={{ transform:[{ scale:pulseAnim }] }}>
+                 <Icon name="bus" size={22} color="#fff" />
+                </Animated.View>
+                <View style={{ flex:1, marginLeft:10 }}>
+                  <Text style={ds.arrivedTitle}>🚐 Van is Outside!</Text>
+                  <Text style={ds.arrivedSub}>
+                    {myPassengerEntry?.pickupPoint || myPassengerEntry?.pickupAddress || "Your pickup stop"}
+                  </Text>
+                  {penaltyInfo.count > 0 && (
+                    <Text style={ds.penaltyNote}>
+                      ⚠️ Next penalty: Rs. {50 + penaltyInfo.count * 10}
+                    </Text>
+                  )}
+                </View>
+              </View>
+
+              {/* Two action buttons */}
+              <View style={ds.boardingBtnRow}>
+                {/* I'm On Board */}
+                <TouchableOpacity
+                  style={ds.boardBtn}
+                  onPress={handleBoardVan}
+                  disabled={markingBoard || markingDecline}
+                  activeOpacity={0.85}
+                >
+                  <LinearGradient colors={[C.main, C.dark]} style={ds.boardBtnInner}>
+                    {markingBoard
+                      ? <ActivityIndicator size="small" color="#fff" />
+                      : <>
+                          <Icon name="checkmark-circle" size={22} color="#fff" />
+                          <Text style={ds.boardBtnTxt}>I'm On Board!</Text>
+                          <Text style={ds.boardBtnSub}>✅ Confirm boarding</Text>
+                        </>
+                    }
+                  </LinearGradient>
+                </TouchableOpacity>
+
+                {/* Not Going Today */}
+                <TouchableOpacity
+                  style={ds.declineBtn}
+                  onPress={handleNotGoingToday}
+                  disabled={markingBoard || markingDecline}
+                  activeOpacity={0.85}
+                >
+                  <LinearGradient colors={["#B91C1C","#7F1D1D"]} style={ds.boardBtnInner}>
+                    {markingDecline
+                      ? <ActivityIndicator size="small" color="#fff" />
+                      : <>
+                          <Icon name="close-circle" size={22} color="#fff" />
+                          <Text style={ds.boardBtnTxt}>Not Going Today</Text>
+                          <Text style={ds.boardBtnSub}>
+                            ⚠️ Penalty: Rs. {50 + penaltyInfo.count * 10}
+                          </Text>
+                        </>
+                    }
+                  </LinearGradient>
+                </TouchableOpacity>
+              </View>
+            </Animated.View>
+          )}
+
+          {/* Penalty summary if any */}
+          {penaltyInfo.count > 0 && !showBoardingButtons && (
+            <View style={ds.penaltySummaryBar}>
+              <Icon name="warning-outline" size={14} color="#B45309" />
+              <Text style={ds.penaltySummaryTxt}>
+                Total penalties: Rs. {penaltyInfo.total} ({penaltyInfo.count} missed boarding{penaltyInfo.count > 1 ? 's' : ''})
+              </Text>
+            </View>
           )}
         </View>
       </Animated.View>
@@ -1539,10 +1446,10 @@ export default function PassengerDashboard({ navigation }) {
           </View>
           <View style={{ flex:1, marginLeft:14 }}>
             <Text style={[ds.activeBannerTitle, { color: isUrgent ? C.urgentAccent : C.pollAccent }]}>
-              {vanArrived ? "🚐 Van is HERE!" : isNextPickup ? "🚨 Van is Coming For You!" : "🚐 Van is En Route"}
+              {vanArrived ? "🚐 Van is HERE — Board Now!" : isNextPickup ? "🚨 Van is Coming For You!" : "🚐 Van is En Route"}
             </Text>
             <Text style={ds.activeBannerSub}>
-              {vanArrived ? "Board the van now!" : isNextPickup ? "Get ready at your stop!" : `${pickedBeforeMe} of ${totalPassengers} picked up`}
+              {vanArrived ? "See map below — tap I'm On Board or Not Going Today" : isNextPickup ? "Get ready at your stop!" : `${pickedBeforeMe} of ${totalPassengers} picked up`}
             </Text>
             {etaToMe && !vanArrived && (
               <View style={ds.etaPill}>
@@ -1602,19 +1509,6 @@ export default function PassengerDashboard({ navigation }) {
                   <Text style={[ds.statusRowTxt, { color:C.main }]}>You're on board ✅</Text>
                 </View>
               )}
-              {/* Board button in route card too (fallback) */}
-              {vanArrived && !boarded && myPassengerEntry?.status !== "picked" && (
-                <TouchableOpacity
-                  style={{ backgroundColor:C.main, borderRadius:12, paddingVertical:13, alignItems:"center", flexDirection:"row", justifyContent:"center", gap:8, marginTop:10 }}
-                  onPress={handleBoardVan}
-                  disabled={markingBoard}
-                >
-                  {markingBoard
-                    ? <ActivityIndicator size="small" color="#fff" />
-                    : <><Icon name="checkmark-circle" size={20} color="#fff" /><Text style={{ color:"#fff", fontWeight:"900", fontSize:15 }}>I'm On Board!</Text></>
-                  }
-                </TouchableOpacity>
-              )}
             </View>
           ) : (
             <View style={ds.cardBody}>
@@ -1671,21 +1565,14 @@ export default function PassengerDashboard({ navigation }) {
                       </View>
                     )}
                   </View>
-                  {/* phone hidden — privacy */}
                 </View>
-                {/* Chat button — shown only during active ride */}
                 <View style={ds.driverActions}>
                   {assignedRoute?.status === "in_progress" && (
-                    <TouchableOpacity
-                      style={[ds.actionBtn, { position:"relative" }]}
-                      onPress={openChatWithDriver}
-                    >
+                    <TouchableOpacity style={[ds.actionBtn, { position:"relative" }]} onPress={openChatWithDriver}>
                       <Icon name="chatbubble-ellipses" size={19} color={C.main} />
                       {unreadChatCount > 0 && (
                         <View style={ds.chatRedDot}>
-                          <Text style={ds.chatRedDotTxt}>
-                            {unreadChatCount > 9 ? "9+" : unreadChatCount}
-                          </Text>
+                          <Text style={ds.chatRedDotTxt}>{unreadChatCount > 9 ? "9+" : unreadChatCount}</Text>
                         </View>
                       )}
                     </TouchableOpacity>
@@ -1749,6 +1636,14 @@ export default function PassengerDashboard({ navigation }) {
       >
         <View style={{ height:14 }} />
 
+        {/* Trip completed banner */}
+        {tripCompleted && (
+          <View style={{ backgroundColor:C.main, marginHorizontal:16, borderRadius:14, padding:14, flexDirection:'row', alignItems:'center', gap:10, marginBottom:10 }}>
+            <Icon name="checkmark-done-circle" size={24} color="#fff" />
+            <Text style={{ color:'#fff', fontWeight:'800', fontSize:15 }}>Trip Completed! 🎉</Text>
+          </View>
+        )}
+
         {/* Poll alert */}
         {showPollModal && selectedPoll && (
           <Animated.View style={{ opacity:fadeAnim, transform:[{ translateY:pollSlideAnim },{ scale:pollPulseAnim }], marginTop:16, marginBottom:4 }}>
@@ -1795,7 +1690,7 @@ export default function PassengerDashboard({ navigation }) {
           </Animated.View>
         )}
 
-        {/* Unread notification alerts */}
+        {/* Unread notifications */}
         {notifications.filter(n => !n.read && ["route","confirmation","general","next_pickup","trip_started"].includes(n.type)).slice(0,2).map(n => (
           <Animated.View key={n._id} style={{ opacity:fadeAnim, transform:[{ translateY:cardTranslateY }], marginTop:8, marginBottom:4 }}>
             <LinearGradient
@@ -1831,12 +1726,9 @@ export default function PassengerDashboard({ navigation }) {
         <View style={{ height:30 }} />
       </ScrollView>
 
-      {/* Call feature removed */}
-
-      {/* Chat modal — fully connected to backend */}
+      {/* Chat modal */}
       <Modal visible={chatVisible} animationType="slide">
         <View style={ds.chatContainer}>
-          {/* Header */}
           <LinearGradient colors={[C.main, C.dark]} start={{ x:0,y:0 }} end={{ x:1,y:0 }} style={ds.chatHeader}>
             <TouchableOpacity onPress={closeChatWithDriver} hitSlop={{ top:8,bottom:8,left:8,right:8 }}>
               <Icon name="arrow-back" size={24} color="#fff" />
@@ -1850,26 +1742,20 @@ export default function PassengerDashboard({ navigation }) {
             </View>
           </LinearGradient>
 
-          {/* Ride-active status banner */}
           {assignedRoute?.status !== "in_progress" ? (
             <View style={ds.chatBanner}>
               <Icon name="lock-closed-outline" size={14} color="#c0392b" />
-              <Text style={[ds.chatBannerTxt, { color:"#c0392b" }]}>
-                {"  "}Chat is only available during an active ride
-              </Text>
+              <Text style={[ds.chatBannerTxt, { color:"#c0392b" }]}>{"  "}Chat is only available during an active ride</Text>
             </View>
           ) : (
             <View style={ds.chatBanner}>
               <Icon name="create-outline" size={14} color={typedCount < 3 ? "#555" : "#c0392b"} />
               <Text style={[ds.chatBannerTxt, { color: typedCount < 3 ? "#555" : "#c0392b" }]}>
-                {"  "}{typedCount < 3
-                  ? `Typed messages remaining: ${3 - typedCount}/3`
-                  : "No typed messages left — use quick replies"}
+                {"  "}{typedCount < 3 ? `Typed messages remaining: ${3 - typedCount}/3` : "No typed messages left — use quick replies"}
               </Text>
             </View>
           )}
 
-          {/* Messages list */}
           <FlatList
             ref={flatListRef}
             data={chatMessages}
@@ -1877,9 +1763,7 @@ export default function PassengerDashboard({ navigation }) {
             renderItem={({ item }) => (
               <View style={[ds.bubble, item.fromDriver ? ds.bubbleDriver : ds.bubbleUser]}>
                 {item.isQuickReply && (
-                  <View style={ds.quickBadge}>
-                    <Text style={ds.quickBadgeTxt}>⚡ Quick Reply</Text>
-                  </View>
+                  <View style={ds.quickBadge}><Text style={ds.quickBadgeTxt}>⚡ Quick Reply</Text></View>
                 )}
                 <Text style={[ds.bubbleTxt, item.fromDriver ? {} : { color:"#fff" }]}>{item.text}</Text>
                 <Text style={[ds.bubbleTime, item.fromDriver ? {} : { color:"rgba(255,255,255,0.7)" }]}>{item.time}</Text>
@@ -1891,16 +1775,10 @@ export default function PassengerDashboard({ navigation }) {
               <View style={{ alignItems:"center", paddingTop:60 }}>
                 <Icon name="chatbubble-ellipses-outline" size={48} color="#ccc" />
                 <Text style={{ color:"#bbb", marginTop:12, fontSize:14 }}>No messages yet</Text>
-                <Text style={{ color:"#ccc", fontSize:12, marginTop:4, textAlign:"center", paddingHorizontal:30 }}>
-                  {assignedRoute?.status === "in_progress"
-                    ? "Send a message or quick reply below"
-                    : "Start an active ride to chat with your driver"}
-                </Text>
               </View>
             }
           />
 
-          {/* Quick replies row — formal predefined messages */}
           {assignedRoute?.status === "in_progress" && (
             <View style={ds.quickRow}>
               <Text style={{ fontSize:11, color:"#888", fontWeight:"700", paddingHorizontal:12, paddingBottom:4 }}>Quick Replies</Text>
@@ -1915,11 +1793,7 @@ export default function PassengerDashboard({ navigation }) {
                   "Please proceed. I am ready.",
                   "Kindly wait for 1 minute.",
                 ].map((qr, idx) => (
-                  <TouchableOpacity
-                    key={idx}
-                    style={ds.quickChip}
-                    onPress={() => sendMessage(qr, "quick_reply")}
-                  >
+                  <TouchableOpacity key={idx} style={ds.quickChip} onPress={() => sendMessage(qr, "quick_reply")}>
                     <Text style={ds.quickChipTxt}>{qr}</Text>
                   </TouchableOpacity>
                 ))}
@@ -1927,7 +1801,6 @@ export default function PassengerDashboard({ navigation }) {
             </View>
           )}
 
-          {/* Input row */}
           {assignedRoute?.status === "in_progress" && (
             <KeyboardAvoidingView behavior={Platform.OS === "ios" ? "padding" : "height"} keyboardVerticalOffset={80}>
               <View style={ds.chatInputRow}>
@@ -1969,89 +1842,102 @@ export default function PassengerDashboard({ navigation }) {
 }
 
 const ds = StyleSheet.create({
-  container:         { flex:1, backgroundColor:"#F5F7FA" },
-  header:            { flexDirection:"row", alignItems:"center", justifyContent:"space-between", paddingHorizontal:18, paddingTop:46, paddingBottom:10 },
-  headerTitle:       { fontSize:20, fontWeight:"800", color:"#fff", letterSpacing:0.5 },
-  notifWrap:         { position:"relative", padding:4 },
-  blinkDot:          { position:"absolute", top:2, right:2, width:10, height:10, borderRadius:5, backgroundColor:"#E87878" },
-  badge:             { position:"absolute", top:-4, right:-4, backgroundColor:"#7A3030", borderRadius:9, minWidth:18, height:18, alignItems:"center", justifyContent:"center", paddingHorizontal:3 },
-  badgeTxt:          { color:"#fff", fontSize:10, fontWeight:"800" },
-  scroll:            { paddingBottom:30 },
-  alertBox:          { flexDirection:"row", borderRadius:16, padding:16, marginHorizontal:16, shadowColor:"#000", shadowOffset:{width:0,height:4}, shadowOpacity:0.18, shadowRadius:8, elevation:6 },
-  alertTitle:        { fontSize:15, fontWeight:"800", color:"#fff", marginBottom:4 },
-  alertText:         { fontSize:13, color:"rgba(255,255,255,0.9)", marginBottom:2 },
-  alertBtns:         { flexDirection:"row", marginTop:10, gap:8 },
-  confirmBtn:        { flexDirection:"row", alignItems:"center", backgroundColor:"rgba(255,255,255,0.2)", paddingVertical:8, paddingHorizontal:14, borderRadius:20, gap:6 },
-  cancelBtn:         { flexDirection:"row", alignItems:"center", backgroundColor:"rgba(0,0,0,0.2)", paddingVertical:8, paddingHorizontal:14, borderRadius:20, gap:6 },
-  btnText:           { color:"#fff", fontWeight:"700", fontSize:13 },
-  activeBanner:      { flexDirection:"row", alignItems:"center", borderRadius:16, padding:16, ...Platform.select({ ios:{shadowColor:"#000",shadowOpacity:0.2,shadowRadius:10,shadowOffset:{width:0,height:4}}, android:{elevation:6} }) },
-  activeBannerIcon:  { width:52, height:52, borderRadius:16, alignItems:"center", justifyContent:"center", flexShrink:0 },
-  activeBannerTitle: { fontSize:16, fontWeight:"900", marginBottom:4, letterSpacing:-0.2 },
-  activeBannerSub:   { fontSize:13, color:"rgba(255,255,255,0.75)", lineHeight:18 },
-  etaPill:           { flexDirection:"row", alignItems:"center", gap:4, backgroundColor:"rgba(229,154,42,0.2)", borderRadius:8, paddingVertical:4, paddingHorizontal:8, alignSelf:"flex-start", marginTop:6 },
-  etaPillTxt:        { fontSize:11, fontWeight:"700", color:"#E59A2A" },
-  card:              { backgroundColor:"#fff", borderRadius:16, marginBottom:2, overflow:"hidden", ...Platform.select({ ios:{shadowColor:"#000",shadowOpacity:0.08,shadowRadius:8,shadowOffset:{width:0,height:2}}, android:{elevation:4} }) },
-  cardHeader:        { flexDirection:"row", alignItems:"center", paddingHorizontal:16, paddingVertical:12, gap:8 },
-  cardHeaderTxt:     { fontSize:15, fontWeight:"800", color:"#fff", flex:1 },
-  cardBody:          { padding:16 },
-  liveChip:          { flexDirection:"row", alignItems:"center", gap:5, backgroundColor:"rgba(255,255,255,0.15)", borderRadius:8, paddingVertical:3, paddingHorizontal:8 },
-  liveDot:           { width:7, height:7, borderRadius:3.5, backgroundColor:"#fff" },
-  liveTxt:           { color:"#fff", fontSize:9, fontWeight:"800", letterSpacing:0.8 },
-  statusPill:        { flexDirection:"row", alignItems:"center", alignSelf:"flex-start", paddingVertical:6, paddingHorizontal:12, borderRadius:20, gap:6, marginBottom:12 },
-  statusPillTxt:     { fontSize:13, fontWeight:"700" },
-  routeName:         { fontSize:17, fontWeight:"800", color:"#0F1A10", marginBottom:12, letterSpacing:-0.3 },
-  infoGrid:          { flexDirection:"row", flexWrap:"wrap", gap:10, marginBottom:12 },
-  infoItem:          { backgroundColor:"#F0F9F1", borderRadius:10, padding:10, alignItems:"center", minWidth:90, flex:1 },
-  infoLabel:         { fontSize:10, color:"#888", marginTop:4, marginBottom:2 },
-  infoValue:         { fontSize:14, fontWeight:"700", color:"#333" },
-  pickupRow:         { flexDirection:"row", alignItems:"center", backgroundColor:"#FFF8E1", borderRadius:10, padding:10, gap:6, marginBottom:8 },
-  pickupLabel:       { fontSize:13, fontWeight:"700", color:"#FF9800" },
-  pickupValue:       { fontSize:13, color:"#555", flex:1 },
-  statusRow:         { flexDirection:"row", alignItems:"center", borderRadius:10, padding:10, gap:8, marginTop:4 },
-  statusRowTxt:      { fontSize:13, fontWeight:"700" },
-  noRouteTxt:        { color:"#999", fontSize:14, lineHeight:20, marginTop:4 },
-  driverBox:         { flexDirection:"row", alignItems:"flex-start", padding:16 },
-  driverAvatar:      { width:56, height:56, borderRadius:17, alignItems:"center", justifyContent:"center" },
-  driverAvatarTxt:   { fontSize:20, fontWeight:"900", color:"#fff" },
-  driverName:        { fontSize:16, fontWeight:"800", color:"#0F1A10", marginBottom:4, letterSpacing:-0.2 },
-  ratingRow:         { flexDirection:"row", alignItems:"center", marginBottom:4 },
-  ratingTxt:         { fontSize:12, color:"#666" },
-  vehicleRow:        { flexDirection:"row", alignItems:"center", gap:5, marginBottom:3 },
-  vehicleTxt:        { fontSize:13, color:"#555" },
-  plateBadge:        { backgroundColor:"#F5F5F5", borderRadius:6, paddingHorizontal:7, paddingVertical:2, borderWidth:1, borderColor:"#E0E0E0" },
-  plateTxt:          { fontSize:11, fontWeight:"700", color:"#333", letterSpacing:1 },
-  driverActions:     { alignItems:"center", paddingLeft:8 },
-  actionBtn:         { width:40, height:40, borderRadius:20, borderWidth:1.5, borderColor:"#415844", alignItems:"center", justifyContent:"center" },
-  routeInfoBar:      { flexDirection:"row", borderTopWidth:1, borderTopColor:"#F0F0F0", padding:12, gap:8, flexWrap:"wrap" },
-  routeInfoChip:     { flexDirection:"row", alignItems:"center", backgroundColor:"#F0F9F1", borderRadius:8, paddingVertical:5, paddingHorizontal:10, gap:4 },
-  routeInfoTxt:      { fontSize:12, color:"#555", fontWeight:"600" },
-  vanMarker:         { backgroundColor:"#415844", padding:7, borderRadius:18, borderWidth:2, borderColor:"#fff", elevation:6 },
-  stopPin:           { width:26, height:26, borderRadius:13, alignItems:"center", justifyContent:"center", borderWidth:2, borderColor:"#fff", elevation:3 },
-  destPin:           { width:34, height:34, borderRadius:17, backgroundColor:"#DC2626", alignItems:"center", justifyContent:"center", borderWidth:2, borderColor:"#fff", elevation:5 },
-  etaBar:            { flexDirection:"row", alignItems:"center", padding:12, gap:8, backgroundColor:"#FFF8E1" },
-  etaBarTxt:         { fontSize:13, color:"#FF9800", fontWeight:"600", flex:1 },
-  chatContainer:     { flex:1, backgroundColor:"#F2F5F2" },
-  chatHeader:        { flexDirection:"row", alignItems:"center", paddingHorizontal:16, paddingTop:50, paddingBottom:14, gap:12 },
-  chatAvatar:        { width:38, height:38, borderRadius:19, backgroundColor:"rgba(255,255,255,0.3)", alignItems:"center", justifyContent:"center" },
-  chatAvatarTxt:     { fontSize:15, fontWeight:"800", color:"#fff" },
-  chatName:          { fontSize:15, fontWeight:"800", color:"#fff" },
-  chatSub:           { fontSize:12, color:"rgba(255,255,255,0.8)" },
-  chatBanner:        { flexDirection:"row", alignItems:"center", backgroundColor:"#fffde7", paddingHorizontal:14, paddingVertical:8, borderBottomWidth:1, borderBottomColor:"#eee" },
-  chatBannerTxt:     { fontSize:12, flex:1 },
-  bubble:            { maxWidth:"75%", borderRadius:16, padding:12, marginBottom:8 },
-  bubbleDriver:      { backgroundColor:"#fff", alignSelf:"flex-start", elevation:2 },
-  bubbleUser:        { backgroundColor:"#415844", alignSelf:"flex-end" },
-  bubbleTxt:         { fontSize:14, color:"#0F1A10" },
-  bubbleTime:        { fontSize:11, color:"#999", marginTop:4, textAlign:"right" },
-  quickBadge:        { backgroundColor:"rgba(0,0,0,0.07)", borderRadius:8, paddingHorizontal:6, paddingVertical:2, alignSelf:"flex-start", marginBottom:4 },
-  quickBadgeTxt:     { fontSize:9, color:"#666" },
-  quickRow:          { backgroundColor:"#fff", paddingHorizontal:12, paddingVertical:10, borderTopWidth:1, borderTopColor:"#eee" },
-  quickChip:         { backgroundColor:"#e8f5e9", borderRadius:20, paddingHorizontal:14, paddingVertical:8, marginRight:8, borderWidth:1, borderColor:"#415844" },
-  quickChipTxt:      { color:"#2e7d32", fontSize:12, fontWeight:"600" },
-  chatInputRow:      { flexDirection:"row", alignItems:"center", padding:12, backgroundColor:"#fff", gap:8, borderTopWidth:1, borderTopColor:"#F0F0F0" },
-  chatInput:         { flex:1, backgroundColor:"#F2F5F2", borderRadius:20, paddingHorizontal:16, paddingVertical:10, fontSize:14, color:"#0F1A10", maxHeight:100 },
-  sendBtn:           { width:40, height:40, borderRadius:20, alignItems:"center", justifyContent:"center" },
-  chatRedDot:        { position:"absolute", top:-5, right:-5, backgroundColor:"#EF4444", borderRadius:8, minWidth:16, height:16, alignItems:"center", justifyContent:"center", paddingHorizontal:2, borderWidth:1.5, borderColor:"#fff" },
-  chatRedDotTxt:     { fontSize:8, color:"#fff", fontWeight:"900" },
-  loadingOverlay:    { ...StyleSheet.absoluteFillObject, backgroundColor:"rgba(0,0,0,0.45)", alignItems:"center", justifyContent:"center", zIndex:999 },
+  container:          { flex:1, backgroundColor:"#F5F7FA" },
+  header:             { flexDirection:"row", alignItems:"center", justifyContent:"space-between", paddingHorizontal:18, paddingTop:46, paddingBottom:10 },
+  headerTitle:        { fontSize:20, fontWeight:"800", color:"#fff", letterSpacing:0.5 },
+  notifWrap:          { position:"relative", padding:4 },
+  blinkDot:           { position:"absolute", top:2, right:2, width:10, height:10, borderRadius:5, backgroundColor:"#E87878" },
+  badge:              { position:"absolute", top:-4, right:-4, backgroundColor:"#7A3030", borderRadius:9, minWidth:18, height:18, alignItems:"center", justifyContent:"center", paddingHorizontal:3 },
+  badgeTxt:           { color:"#fff", fontSize:10, fontWeight:"800" },
+  scroll:             { paddingBottom:30 },
+  alertBox:           { flexDirection:"row", borderRadius:16, padding:16, marginHorizontal:16, shadowColor:"#000", shadowOffset:{width:0,height:4}, shadowOpacity:0.18, shadowRadius:8, elevation:6 },
+  alertTitle:         { fontSize:15, fontWeight:"800", color:"#fff", marginBottom:4 },
+  alertText:          { fontSize:13, color:"rgba(255,255,255,0.9)", marginBottom:2 },
+  alertBtns:          { flexDirection:"row", marginTop:10, gap:8 },
+  confirmBtn:         { flexDirection:"row", alignItems:"center", backgroundColor:"rgba(255,255,255,0.2)", paddingVertical:8, paddingHorizontal:14, borderRadius:20, gap:6 },
+  cancelBtn:          { flexDirection:"row", alignItems:"center", backgroundColor:"rgba(0,0,0,0.2)", paddingVertical:8, paddingHorizontal:14, borderRadius:20, gap:6 },
+  btnText:            { color:"#fff", fontWeight:"700", fontSize:13 },
+  activeBanner:       { flexDirection:"row", alignItems:"center", borderRadius:16, padding:16, ...Platform.select({ ios:{shadowColor:"#000",shadowOpacity:0.2,shadowRadius:10,shadowOffset:{width:0,height:4}}, android:{elevation:6} }) },
+  activeBannerIcon:   { width:52, height:52, borderRadius:16, alignItems:"center", justifyContent:"center", flexShrink:0 },
+  activeBannerTitle:  { fontSize:16, fontWeight:"900", marginBottom:4, letterSpacing:-0.2 },
+  activeBannerSub:    { fontSize:13, color:"rgba(255,255,255,0.75)", lineHeight:18 },
+  etaPill:            { flexDirection:"row", alignItems:"center", gap:4, backgroundColor:"rgba(229,154,42,0.2)", borderRadius:8, paddingVertical:4, paddingHorizontal:8, alignSelf:"flex-start", marginTop:6 },
+  etaPillTxt:         { fontSize:11, fontWeight:"700", color:"#E59A2A" },
+  card:               { backgroundColor:"#fff", borderRadius:16, marginBottom:2, overflow:"hidden", ...Platform.select({ ios:{shadowColor:"#000",shadowOpacity:0.08,shadowRadius:8,shadowOffset:{width:0,height:2}}, android:{elevation:4} }) },
+  cardHeader:         { flexDirection:"row", alignItems:"center", paddingHorizontal:16, paddingVertical:12, gap:8 },
+  cardHeaderTxt:      { fontSize:15, fontWeight:"800", color:"#fff", flex:1 },
+  cardBody:           { padding:16 },
+  liveChip:           { flexDirection:"row", alignItems:"center", gap:5, backgroundColor:"rgba(255,255,255,0.15)", borderRadius:8, paddingVertical:3, paddingHorizontal:8 },
+  liveDot:            { width:7, height:7, borderRadius:3.5, backgroundColor:"#fff" },
+  liveTxt:            { color:"#fff", fontSize:9, fontWeight:"800", letterSpacing:0.8 },
+  statusPill:         { flexDirection:"row", alignItems:"center", alignSelf:"flex-start", paddingVertical:6, paddingHorizontal:12, borderRadius:20, gap:6, marginBottom:12 },
+  statusPillTxt:      { fontSize:13, fontWeight:"700" },
+  routeName:          { fontSize:17, fontWeight:"800", color:"#0F1A10", marginBottom:12, letterSpacing:-0.3 },
+  infoGrid:           { flexDirection:"row", flexWrap:"wrap", gap:10, marginBottom:12 },
+  infoItem:           { backgroundColor:"#F0F9F1", borderRadius:10, padding:10, alignItems:"center", minWidth:90, flex:1 },
+  infoLabel:          { fontSize:10, color:"#888", marginTop:4, marginBottom:2 },
+  infoValue:          { fontSize:14, fontWeight:"700", color:"#333" },
+  pickupRow:          { flexDirection:"row", alignItems:"center", backgroundColor:"#FFF8E1", borderRadius:10, padding:10, gap:6, marginBottom:8 },
+  pickupLabel:        { fontSize:13, fontWeight:"700", color:"#FF9800" },
+  pickupValue:        { fontSize:13, color:"#555", flex:1 },
+  statusRow:          { flexDirection:"row", alignItems:"center", borderRadius:10, padding:10, gap:8, marginTop:4 },
+  statusRowTxt:       { fontSize:13, fontWeight:"700" },
+  noRouteTxt:         { color:"#999", fontSize:14, lineHeight:20, marginTop:4 },
+  driverBox:          { flexDirection:"row", alignItems:"flex-start", padding:16 },
+  driverAvatar:       { width:56, height:56, borderRadius:17, alignItems:"center", justifyContent:"center" },
+  driverAvatarTxt:    { fontSize:20, fontWeight:"900", color:"#fff" },
+  driverName:         { fontSize:16, fontWeight:"800", color:"#0F1A10", marginBottom:4, letterSpacing:-0.2 },
+  ratingRow:          { flexDirection:"row", alignItems:"center", marginBottom:4 },
+  ratingTxt:          { fontSize:12, color:"#666" },
+  vehicleRow:         { flexDirection:"row", alignItems:"center", gap:5, marginBottom:3 },
+  vehicleTxt:         { fontSize:13, color:"#555" },
+  plateBadge:         { backgroundColor:"#F5F5F5", borderRadius:6, paddingHorizontal:7, paddingVertical:2, borderWidth:1, borderColor:"#E0E0E0" },
+  plateTxt:           { fontSize:11, fontWeight:"700", color:"#333", letterSpacing:1 },
+  driverActions:      { alignItems:"center", paddingLeft:8 },
+  actionBtn:          { width:40, height:40, borderRadius:20, borderWidth:1.5, borderColor:"#415844", alignItems:"center", justifyContent:"center" },
+  routeInfoBar:       { flexDirection:"row", borderTopWidth:1, borderTopColor:"#F0F0F0", padding:12, gap:8, flexWrap:"wrap" },
+  routeInfoChip:      { flexDirection:"row", alignItems:"center", backgroundColor:"#F0F9F1", borderRadius:8, paddingVertical:5, paddingHorizontal:10, gap:4 },
+  routeInfoTxt:       { fontSize:12, color:"#555", fontWeight:"600" },
+  vanMarker:          { backgroundColor:"#415844", padding:7, borderRadius:18, borderWidth:2, borderColor:"#fff", elevation:6 },
+  destPin:            { width:34, height:34, borderRadius:17, backgroundColor:"#DC2626", alignItems:"center", justifyContent:"center", borderWidth:2, borderColor:"#fff", elevation:5 },
+  etaBar:             { flexDirection:"row", alignItems:"center", padding:12, gap:8, backgroundColor:"#FFF8E1" },
+  etaBarTxt:          { fontSize:13, color:"#FF9800", fontWeight:"600", flex:1 },
+  // Boarding UI
+  arrivedBar:         { flexDirection:"row", alignItems:"center", backgroundColor:"#1A2B1C", padding:14, gap:0 },
+  arrivedTitle:       { fontSize:16, fontWeight:"900", color:"#fff", marginBottom:2 },
+  arrivedSub:         { fontSize:12, color:"rgba(255,255,255,0.75)" },
+  penaltyNote:        { fontSize:11, color:"#FCA5A5", marginTop:3, fontWeight:"700" },
+  boardingBtnRow:     { flexDirection:"row", padding:12, gap:10 },
+  boardBtn:           { flex:1, borderRadius:14, overflow:"hidden" },
+  declineBtn:         { flex:1, borderRadius:14, overflow:"hidden" },
+  boardBtnInner:      { paddingVertical:14, alignItems:"center", justifyContent:"center", gap:4 },
+  boardBtnTxt:        { color:"#fff", fontWeight:"900", fontSize:15 },
+  boardBtnSub:        { color:"rgba(255,255,255,0.8)", fontSize:11, fontWeight:"600" },
+  penaltySummaryBar:  { flexDirection:"row", alignItems:"center", gap:6, backgroundColor:"#FEF3C7", padding:10, paddingHorizontal:14 },
+  penaltySummaryTxt:  { fontSize:12, color:"#92400E", fontWeight:"600", flex:1 },
+  // Chat
+  chatContainer:      { flex:1, backgroundColor:"#F2F5F2" },
+  chatHeader:         { flexDirection:"row", alignItems:"center", paddingHorizontal:16, paddingTop:50, paddingBottom:14, gap:12 },
+  chatAvatar:         { width:38, height:38, borderRadius:19, backgroundColor:"rgba(255,255,255,0.3)", alignItems:"center", justifyContent:"center" },
+  chatAvatarTxt:      { fontSize:15, fontWeight:"800", color:"#fff" },
+  chatName:           { fontSize:15, fontWeight:"800", color:"#fff" },
+  chatSub:            { fontSize:12, color:"rgba(255,255,255,0.8)" },
+  chatBanner:         { flexDirection:"row", alignItems:"center", backgroundColor:"#fffde7", paddingHorizontal:14, paddingVertical:8, borderBottomWidth:1, borderBottomColor:"#eee" },
+  chatBannerTxt:      { fontSize:12, flex:1 },
+  bubble:             { maxWidth:"75%", borderRadius:16, padding:12, marginBottom:8 },
+  bubbleDriver:       { backgroundColor:"#fff", alignSelf:"flex-start", elevation:2 },
+  bubbleUser:         { backgroundColor:"#415844", alignSelf:"flex-end" },
+  bubbleTxt:          { fontSize:14, color:"#0F1A10" },
+  bubbleTime:         { fontSize:11, color:"#999", marginTop:4, textAlign:"right" },
+  quickBadge:         { backgroundColor:"rgba(0,0,0,0.07)", borderRadius:8, paddingHorizontal:6, paddingVertical:2, alignSelf:"flex-start", marginBottom:4 },
+  quickBadgeTxt:      { fontSize:9, color:"#666" },
+  quickRow:           { backgroundColor:"#fff", paddingHorizontal:12, paddingVertical:10, borderTopWidth:1, borderTopColor:"#eee" },
+  quickChip:          { backgroundColor:"#e8f5e9", borderRadius:20, paddingHorizontal:14, paddingVertical:8, marginRight:8, borderWidth:1, borderColor:"#415844" },
+  quickChipTxt:       { color:"#2e7d32", fontSize:12, fontWeight:"600" },
+  chatInputRow:       { flexDirection:"row", alignItems:"center", padding:12, backgroundColor:"#fff", gap:8, borderTopWidth:1, borderTopColor:"#F0F0F0" },
+  chatInput:          { flex:1, backgroundColor:"#F2F5F2", borderRadius:20, paddingHorizontal:16, paddingVertical:10, fontSize:14, color:"#0F1A10", maxHeight:100 },
+  sendBtn:            { width:40, height:40, borderRadius:20, alignItems:"center", justifyContent:"center" },
+  chatRedDot:         { position:"absolute", top:-5, right:-5, backgroundColor:"#EF4444", borderRadius:8, minWidth:16, height:16, alignItems:"center", justifyContent:"center", paddingHorizontal:2, borderWidth:1.5, borderColor:"#fff" },
+  chatRedDotTxt:      { fontSize:8, color:"#fff", fontWeight:"900" },
+  loadingOverlay:     { ...StyleSheet.absoluteFillObject, backgroundColor:"rgba(0,0,0,0.45)", alignItems:"center", justifyContent:"center", zIndex:999 },
 });

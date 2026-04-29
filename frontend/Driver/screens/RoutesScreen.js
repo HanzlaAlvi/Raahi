@@ -15,6 +15,9 @@
 //   ✅ OSRM road-snapped fallback when Google Directions fails
 //   ✅ Passenger "Not Going" socket event + penalty banner + stop skip
 //   ✅ Route Merge feature (detect + alert + coordinate)
+//   ✅ FIX: Last passenger picked → auto GOING_TO_DESTINATION + destination polyline
+//   ✅ FIX: Dotted polyline shown correctly for destination leg
+//   ✅ FIX: allPicked triggers handleGoingToDestination automatically
 
 import React, { useRef, useEffect, useState, useCallback, useMemo } from "react";
 import {
@@ -29,9 +32,9 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 // ─── Constants ────────────────────────────────────────────────────────────────
 const API_BASE   = "https://raahi-q2ur.onrender.com/api";
 const SOCKET_URL = "https://raahi-q2ur.onrender.com";
-const GMAPS_KEY  = "AIzaSyDs8abfEYT5Y1jQ-m9gYeL0kTAxAU5HJSU";   // ← replace with actual key
+const GMAPS_KEY  = "AIzaSyDs8abfEYT5Y1jQ-m9gYeL0kTAxAU5HJSU";
 const MAX_TYPED  = 3;
-const LOC_INTERVAL_MS = 7000;   // send location every 7 seconds
+const LOC_INTERVAL_MS = 7000;
 
 const BRAND = "#415844";
 const DARK  = "#2D3E2F";
@@ -92,8 +95,6 @@ function resolveDropCoord(p) {
   return null;
 }
 
-// ─── DESTINATION NAME FIX ─────────────────────────────────────────────────────
-// Returns the place/destination name for a passenger — NOT the passenger's name.
 function resolveDestinationName(p) {
   const name = p.destination || p.dropAddress || p.destinationName || null;
   if (name && name.trim() && name !== p.name && name !== p.passengerName) return name;
@@ -212,7 +213,6 @@ async function fetchOsrmRoute(origin, waypoints, destination) {
     const res  = await fetch(url);
     const data = await res.json();
     if (data.code !== "Ok") return null;
-    // Convert GeoJSON coords to {latitude, longitude} array
     return data.routes?.[0]?.geometry?.coordinates?.map(([lng, lat]) => ({ latitude: lat, longitude: lng })) || null;
   } catch { return null; }
 }
@@ -396,11 +396,12 @@ export default function RoutesScreen({
   const pulseAnim = useRef(new Animated.Value(1)).current;
   const socketRef = useRef(null);
   const locTimerRef          = useRef(null);
-  const polylineSentRef      = useRef(false);  // only fetch + send polyline once per route start
-  // Track the lat/lng where the last polyline was generated so we can refresh on significant movement
-  const polylineOriginRef    = useRef(null);   // { latitude, longitude }
-  // Store polyline payload to re-send once socket connects (handles race condition)
-  const pendingBroadcastRef  = useRef(null);   // full payload object
+  const polylineSentRef      = useRef(false);
+  const polylineOriginRef    = useRef(null);
+  const pendingBroadcastRef  = useRef(null);
+
+  // ── FIX: guard to prevent handleGoingToDestination from firing multiple times ──
+  const goingToDestCalledRef = useRef(false);
 
   const [openChatForStopId, setOpenChatForStopId] = useState(null);
   const [unreadMap,          setUnreadMap]         = useState({});
@@ -408,25 +409,20 @@ export default function RoutesScreen({
   const [driverId,           setDriverId]           = useState(null);
   const [countdown,          setCountdown]          = useState("");
 
-  // ── Passenger Not Going state (from doc3) ────────────────────────────────
   const [notGoingIds,   setNotGoingIds]   = useState(new Set());
-  const [notGoingAlert, setNotGoingAlert] = useState(null); // { name, penalty }
+  const [notGoingAlert, setNotGoingAlert] = useState(null);
 
-  // ── Route Merge state ─────────────────────────────────────────────────────
   const [mergeCandidate,    setMergeCandidate]    = useState(null);
   const mergeAlertShownRef  = useRef(false);
   const mergeCheckActiveRef = useRef(false);
 
-  // ── Ride state ─────────────────────────────────────────────────────────────
-  // PICKING_UP | GOING_TO_DESTINATION | COMPLETED
   const [rideState,        setRideState]        = useState("PICKING_UP");
-  const [encodedPolyline,  setEncodedPolyline]  = useState(null);  // from Google Directions
-  const [polylineCoords,   setPolylineCoords]   = useState([]);    // decoded for map
+  const [encodedPolyline,  setEncodedPolyline]  = useState(null);
+  const [polylineCoords,   setPolylineCoords]   = useState([]);
+  const [destPolylineCoords, setDestPolylineCoords] = useState([]);
 
-  // Smooth animated driver marker
   const { latAnim, lngAnim } = useAnimatedCoord(currentLocation);
 
-  // Load auth
   useEffect(() => {
     (async () => {
       const tok = await AsyncStorage.getItem("authToken");
@@ -451,16 +447,12 @@ export default function RoutesScreen({
         socket.emit("joinRoute", { routeId, userId: driverId });
         if (driverId) socket.emit("joinUser", { userId: driverId });
 
-        // ── RECONNECT: re-broadcast any pending or already-generated polyline ──
         if (pendingBroadcastRef.current) {
-          console.log('[Driver] Re-sending pending polyline on socket connect');
           socket.emit("routeUpdate", pendingBroadcastRef.current);
           socket.emit("startRoute",  pendingBroadcastRef.current);
           pendingBroadcastRef.current = null;
         }
         if (polylineSentRef.current && polylineOriginRef.current) {
-          // Force a fresh polyline generation on reconnect so passengers/transporter
-          // always get the latest route from the driver's current position
           polylineSentRef.current = false;
         }
       });
@@ -476,12 +468,8 @@ export default function RoutesScreen({
         setUnreadMap(prev => ({ ...prev, [stopId]: (prev[stopId] || 0) + 1 }));
       });
 
-      // When passenger confirms from their app
-      socket.on("passengerReady", (data) => {
-        // Handled by parent DashboardScreen via passengerConfirmedForStop prop
-      });
+      socket.on("passengerReady", (data) => {});
 
-      // ── Passenger says "I'm Not Going" (from doc3) ───────────────────────
       socket.on("passengerNotGoing", (data) => {
         const { passengerId, passengerName, penaltyAmount } = data || {};
         if (!passengerId) return;
@@ -494,11 +482,9 @@ export default function RoutesScreen({
           name:    passengerName || "A Passenger",
           penalty: penaltyAmount || 0,
         });
-        // Auto-dismiss after 6 seconds
         setTimeout(() => setNotGoingAlert(null), 6000);
       });
 
-      // ── Incoming merge request from another driver ─────────────────────────
       socket.on("routeMergeRequest", (data) => {
         const { fromDriverName, destination, myEtaMin } = data || {};
         Alert.alert(
@@ -531,7 +517,7 @@ export default function RoutesScreen({
     return () => { socketRef.current?.disconnect(); socketRef.current = null; };
   }, [routeStarted, currentRoute?._id, driverId]);
 
-  // ── Location broadcasting — every 7 seconds ────────────────────────────────
+  // ── Location broadcasting ──────────────────────────────────────────────────
   useEffect(() => {
     if (!routeStarted || !currentLocation || !socketRef.current?.connected) return;
     if (locTimerRef.current) clearInterval(locTimerRef.current);
@@ -548,7 +534,6 @@ export default function RoutesScreen({
       socketRef.current.emit("locationUpdate",       locationPayload);
       socketRef.current.emit("driverLocationUpdate", locationPayload);
 
-      // ── Auto route refresh: re-generate polyline if driver moved ≥ 300 m ──
       if (polylineOriginRef.current && polylineSentRef.current) {
         const movedKm = haversineKm(
           currentLocation.latitude,
@@ -557,7 +542,6 @@ export default function RoutesScreen({
           polylineOriginRef.current.longitude
         );
         if (movedKm >= 0.3) {
-          console.log(`[Driver] Moved ${(movedKm * 1000).toFixed(0)}m — refreshing route polyline`);
           polylineSentRef.current = false;
         }
       }
@@ -568,7 +552,6 @@ export default function RoutesScreen({
     return () => clearInterval(locTimerRef.current);
   }, [routeStarted, currentLocation?.latitude, currentLocation?.longitude]);
 
-  // ETA alerts (10 / 5 / 3 / 1 min) to upcoming passenger
   const alertedPassengersRef = useRef(new Set());
   function _checkAndSendEtaAlerts(myLoc) {
     if (!socketRef.current?.connected || !routeStops.length) return;
@@ -592,23 +575,17 @@ export default function RoutesScreen({
     });
   }
 
-  // ── Generate + broadcast Google polyline (driver only, refreshes on movement) ─
-  // Uses OSRM as road-snapped fallback if Google fails (from doc2)
+  // ── Generate + broadcast Google polyline ──────────────────────────────────
   const generateAndBroadcastPolyline = useCallback(async () => {
     if (!routeStarted || !currentRoute || polylineSentRef.current) return;
     if (!currentLocation?.latitude || !currentLocation?.longitude) return;
 
     const dLat = Number(currentLocation.latitude);
     const dLng = Number(currentLocation.longitude);
-    if (!Number.isFinite(dLat) || !Number.isFinite(dLng) || Math.abs(dLat) > 90 || Math.abs(dLng) > 180) {
-      console.warn('[Driver] generateAndBroadcastPolyline: invalid driver coordinates', { dLat, dLng });
-      return;
-    }
+    if (!Number.isFinite(dLat) || !Number.isFinite(dLng) || Math.abs(dLat) > 90 || Math.abs(dLng) > 180) return;
 
-    // Mark sent immediately to prevent duplicate calls while async is in-flight
     polylineSentRef.current = true;
     polylineOriginRef.current = { latitude: dLat, longitude: dLng };
-    console.log('[Driver] Generating polyline from live GPS:', dLat.toFixed(5), dLng.toFixed(5));
 
     const pickupWaypoints = routeStops
       .filter(s => s.status !== "picked" && s.status !== "missed")
@@ -625,11 +602,7 @@ export default function RoutesScreen({
       || currentRoute.passengers?.[0]?.destinationLng
       || currentRoute.passengers?.[0]?.dropLng;
 
-    if (!destLat || !destLng) {
-      console.warn('[Driver] No destination coordinates found — cannot generate polyline');
-      polylineSentRef.current = false;
-      return;
-    }
+    if (!destLat || !destLng) { polylineSentRef.current = false; return; }
 
     const dropOffLocation = {
       latitude:  Number(destLat),
@@ -641,7 +614,6 @@ export default function RoutesScreen({
     const rideId  = currentRoute.tripId || currentRoute._id;
     const routeId = currentRoute._id;
 
-    // Try Google Directions API first
     const encoded = await fetchGoogleRoute(
       { latitude: dLat, longitude: dLng },
       pickupWaypoints,
@@ -649,8 +621,6 @@ export default function RoutesScreen({
     );
 
     if (encoded) {
-      // ── Google Directions succeeded ────────────────────────────────────────
-      console.log('[Driver] Google Directions OK — polyline length:', encoded.length);
       setEncodedPolyline(encoded);
       setPolylineCoords(decodePolyline(encoded));
 
@@ -669,13 +639,10 @@ export default function RoutesScreen({
       if (socketRef.current?.connected) {
         socketRef.current.emit("routeUpdate", broadcastPayload);
         socketRef.current.emit("startRoute",  broadcastPayload);
-        console.log('[Driver] Polyline broadcast via routeUpdate + startRoute');
       } else {
         pendingBroadcastRef.current = broadcastPayload;
-        console.log('[Driver] Socket not connected — polyline queued for reconnect');
       }
 
-      // Save to DB
       try {
         const tok = authTokenRef?.current || driverToken;
         await fetch(`${API_BASE}/routes/${routeId}`, {
@@ -689,9 +656,6 @@ export default function RoutesScreen({
       } catch {}
 
     } else {
-      // ── Google Directions failed — try OSRM road-snapped fallback (from doc2) ──
-      console.warn('[Driver] Google Directions FAILED — trying OSRM road-snap fallback');
-
       const osrmCoords = await fetchOsrmRoute(
         { latitude: dLat, longitude: dLng },
         pickupWaypoints,
@@ -722,13 +686,10 @@ export default function RoutesScreen({
       if (socketRef.current?.connected) {
         socketRef.current.emit("routeUpdate", fallbackPayload);
         socketRef.current.emit("startRoute",  fallbackPayload);
-        console.log('[Driver] OSRM/fallback polyline broadcast to passengers/transporter');
       } else {
         pendingBroadcastRef.current = fallbackPayload;
       }
 
-      // ✅ Keep polylineSentRef=true so we don't spam every interval.
-      // Only re-trigger when driver moves ≥ 300m (handled by auto-refresh logic above).
       polylineSentRef.current = true;
     }
   }, [routeStarted, currentRoute, currentLocation, routeStops, driverToken]);
@@ -743,11 +704,11 @@ export default function RoutesScreen({
       pendingBroadcastRef.current = null;
       setEncodedPolyline(null);
       setPolylineCoords([]);
+      setDestPolylineCoords([]);
       alertedPassengersRef.current = new Set();
     }
   }, [routeStarted, currentLocation?.latitude]);
 
-  // ── Handle "Arrive at Stop" — notify passenger + pause movement ────────────
   const handleArrivedAtStop = useCallback((stop) => {
     if (!socketRef.current?.connected) return;
     const rideId  = currentRoute?.tripId || currentRoute?._id;
@@ -760,7 +721,6 @@ export default function RoutesScreen({
     });
   }, [currentRoute]);
 
-  // ── Confirm boarding — driver side ─────────────────────────────────────────
   const handleDriverConfirmBoarding = useCallback((stop) => {
     if (!socketRef.current?.connected) return;
     const rideId  = currentRoute?.tripId || currentRoute?._id;
@@ -773,8 +733,12 @@ export default function RoutesScreen({
     if (pickupPassenger) pickupPassenger();
   }, [currentRoute, pickupPassenger]);
 
-  // ── Last passenger picked → GOING_TO_DESTINATION ──────────────────────────
+  // ── handleGoingToDestination ───────────────────────────────────────────────
   const handleGoingToDestination = useCallback(async () => {
+    // ── FIX: prevent double-fire ──
+    if (goingToDestCalledRef.current) return;
+    goingToDestCalledRef.current = true;
+
     const rideId  = currentRoute?.tripId || currentRoute?._id;
     const routeId = currentRoute?._id;
 
@@ -783,9 +747,16 @@ export default function RoutesScreen({
     const destLng  = dropOff?.longitude || currentRoute?.destinationLng;
     const destName = dropOff?.name      || currentRoute?.destination || "Destination";
 
-    if (!destLat || !destLng || !currentLocation) return;
+    if (!destLat || !destLng || !currentLocation) {
+      goingToDestCalledRef.current = false;
+      return;
+    }
 
+    // Set state immediately so UI updates
     setRideState("GOING_TO_DESTINATION");
+
+    // ── FIX: clear pickup polyline so only destination line shows ──
+    setPolylineCoords([]);
 
     const encoded = await fetchGoogleRoute(
       currentLocation,
@@ -793,8 +764,23 @@ export default function RoutesScreen({
       { latitude: destLat, longitude: destLng }
     );
 
-    setPolylineCoords(encoded ? decodePolyline(encoded) : []);
-    if (encoded) setEncodedPolyline(encoded);
+    if (encoded) {
+      const decodedDest = decodePolyline(encoded);
+      setDestPolylineCoords(decodedDest);
+      setEncodedPolyline(encoded);
+    } else {
+      // OSRM fallback for destination leg
+      const osrmCoords = await fetchOsrmRoute(
+        currentLocation,
+        [],
+        { latitude: destLat, longitude: destLng }
+      );
+      const fallback = osrmCoords || [
+        { latitude: currentLocation.latitude, longitude: currentLocation.longitude },
+        { latitude: destLat, longitude: destLng },
+      ];
+      setDestPolylineCoords(fallback);
+    }
 
     const dropOffLocation = { latitude: destLat, longitude: destLng, name: destName, address: destName };
 
@@ -806,9 +792,21 @@ export default function RoutesScreen({
       encodedPolyline: encoded,
       dropOffLocation,
     });
+
+    // Fit map to show driver + destination
+    if (currentLocation && destLat && destLng) {
+      setTimeout(() => {
+        mapRef.current?.fitToCoordinates(
+          [
+            { latitude: currentLocation.latitude, longitude: currentLocation.longitude },
+            { latitude: destLat, longitude: destLng },
+          ],
+          { edgePadding: { top: 80, right: 60, bottom: 80, left: 60 }, animated: true }
+        );
+      }, 600);
+    }
   }, [currentRoute, currentLocation]);
 
-  // ── Complete ride — only at final destination ──────────────────────────────
   const handleCompleteRide = useCallback(() => {
     if (rideState !== "GOING_TO_DESTINATION") {
       Alert.alert("Not Yet", "Pick up all passengers and reach destination first.");
@@ -820,7 +818,6 @@ export default function RoutesScreen({
     if (completeRoute) completeRoute();
   }, [rideState, currentRoute, completeRoute]);
 
-  // ── Chat + notGoing clear on ride end ──────────────────────────────────────
   useEffect(() => {
     if (!routeStarted) {
       setOpenChatForStopId(null);
@@ -828,10 +825,13 @@ export default function RoutesScreen({
       setRideState("PICKING_UP");
       setNotGoingIds(new Set());
       setNotGoingAlert(null);
+      setDestPolylineCoords([]);
+      // ── FIX: reset guard when route resets ──
+      goingToDestCalledRef.current = false;
     }
   }, [routeStarted]);
 
-  // ── Route Merge Check ─────────────────────────────────────────────────────
+  // ── Route Merge Check ──────────────────────────────────────────────────────
   const pendingPickupCount = React.useMemo(() => {
     return (rawStops || [])
       .filter(s => s._isDriverOrigin !== true)
@@ -879,18 +879,9 @@ export default function RoutesScreen({
           setMergeCandidate(data.candidate);
           Alert.alert(
             "Route Merge Available 🔀",
-            `Driver ${data.candidate.driverName} is heading to the same destination (${data.candidate.destination}).
-
-Your ETA: ~${data.candidate.myEtaMin} min
-Their ETA: ~${data.candidate.otherEtaMin} min
-
-Would you like to coordinate with them? Your passengers can transfer to their van so neither driver has to wait long.`,
+            `Driver ${data.candidate.driverName} is heading to the same destination (${data.candidate.destination}).\n\nYour ETA: ~${data.candidate.myEtaMin} min\nTheir ETA: ~${data.candidate.otherEtaMin} min\n\nWould you like to coordinate with them?`,
             [
-              {
-                text: "Ignore",
-                style: "cancel",
-                onPress: () => setMergeCandidate(null),
-              },
+              { text: "Ignore", style: "cancel", onPress: () => setMergeCandidate(null) },
               {
                 text: "Coordinate Merge",
                 onPress: () => {
@@ -903,11 +894,7 @@ Would you like to coordinate with them? Your passengers can transfer to their va
                       myEtaMin:       data.candidate.myEtaMin,
                     });
                   }
-                  Alert.alert(
-                    "Merge Request Sent ✅",
-                    `${data.candidate.driverName} has been notified. Coordinate at the next stop to transfer passengers. Complete your route when your passengers have boarded their van.`,
-                    [{ text: "OK" }]
-                  );
+                  Alert.alert("Merge Request Sent ✅", `${data.candidate.driverName} has been notified.`, [{ text: "OK" }]);
                   setMergeCandidate(null);
                 },
               },
@@ -920,9 +907,9 @@ Would you like to coordinate with them? Your passengers can transfer to their va
         mergeCheckActiveRef.current = false;
       }
     })();
-  }, [pendingPickupCount, routeStarted]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [pendingPickupCount, routeStarted]);
 
-  // ── Enrich stops — apply local notGoing override (from doc3) ─────────────
+  // ── Enrich stops ───────────────────────────────────────────────────────────
   const routeStops = (rawStops || [])
     .filter(s => s._isDriverOrigin !== true)
     .map((s, i) => {
@@ -938,6 +925,34 @@ Would you like to coordinate with them? Your passengers can transfer to their va
       };
     });
 
+  // ── FIX: Auto-trigger handleGoingToDestination when allPicked becomes true ──
+  // This is the KEY fix — when last passenger is confirmed picked,
+  // rideState should automatically switch to GOING_TO_DESTINATION
+  // without driver needing to tap the button manually.
+  const pickedCount   = routeStops.filter(s => (s.status === "picked" || completedStops.includes(s._id)) && !s._notGoingLocal).length;
+  const notGoingCount = routeStops.filter(s => s._notGoingLocal || s.status === "missed").length;
+  const pendingCount  = routeStops.filter(
+    s => s.status !== "picked"
+      && !completedStops.includes(s._id)
+      && s.status !== "missed"
+      && !s._notGoingLocal
+  ).length;
+  const allPicked = pendingCount === 0 && routeStops.length > 0;
+
+  // ── FIX: useEffect watches allPicked — auto calls handleGoingToDestination ──
+  useEffect(() => {
+    if (
+      routeStarted &&
+      allPicked &&
+      rideState === "PICKING_UP" &&
+      !waitingAtStop &&
+      currentLocation?.latitude &&
+      !goingToDestCalledRef.current
+    ) {
+      handleGoingToDestination();
+    }
+  }, [allPicked, routeStarted, rideState, waitingAtStop, currentLocation?.latitude]);
+
   // Pulse animation
   useEffect(() => {
     if (!waitingAtStop) { pulseAnim.setValue(1); return; }
@@ -949,16 +964,11 @@ Would you like to coordinate with them? Your passengers can transfer to their va
     return () => anim.stop();
   }, [waitingAtStop]);
 
-  // Countdown disabled — driver can start anytime
-  useEffect(() => {
-    setCountdown("");
-  }, [routeStarted, currentRoute]);
+  useEffect(() => { setCountdown(""); }, [routeStarted, currentRoute]);
 
-  // Auto-fit map
   const driverOriginStop = (rawStops || []).find(s => s._isDriverOrigin === true);
   const stopCoords = routeStops.map(s => s.coordinate);
 
-  // ── DESTINATION NAME FIX: build drop stops with correct destination name ──
   const dropStops = useMemo(() => {
     return (currentRoute?.passengers || []).map((p, i) => {
       const coord = resolveDropCoord(p);
@@ -974,8 +984,7 @@ Would you like to coordinate with them? Your passengers can transfer to their va
 
   const dropCoords = dropStops.map(d => d.coordinate);
 
-  // Use Google polyline if available, else fallback to straight lines
-  // CRITICAL: fallback MUST start from driver's current LIVE position
+  // mapPolylineCoords — only used in PICKING_UP state
   const mapPolylineCoords = polylineCoords.length > 1 ? polylineCoords : [
     ...(currentLocation
       ? [{ latitude: currentLocation.latitude, longitude: currentLocation.longitude }]
@@ -1000,17 +1009,10 @@ Would you like to coordinate with them? Your passengers can transfer to their va
     }, 800);
   }, [routeStarted]);
 
-  // Follow van (smooth)
   useEffect(() => {
     if (!routeStarted || !currentLocation) return;
     mapRef.current?.animateToRegion({ ...currentLocation, latitudeDelta: 0.02, longitudeDelta: 0.02 }, 800);
   }, [currentLocation?.latitude, currentLocation?.longitude]);
-
-  // ── Counts (from doc3) — notGoing excluded from picked count ─────────────
-  const pickedCount   = routeStops.filter(s => (s.status === "picked" || completedStops.includes(s._id)) && !s._notGoingLocal).length;
-  const notGoingCount = routeStops.filter(s => s._notGoingLocal || s.status === "missed").length;
-  const pendingCount  = routeStops.filter(s => s.status !== "picked" && !completedStops.includes(s._id) && s.status !== "missed" && !s._notGoingLocal).length;
-  const allPicked     = pendingCount === 0 && routeStops.length > 0;
 
   const scheduledLabel = currentRoute
     ? (currentRoute.routeStartTime || currentRoute.pickupTime || currentRoute.timeSlot || null)
@@ -1025,7 +1027,6 @@ Would you like to coordinate with them? Your passengers can transfer to their va
   const openChat  = (stopId) => { setOpenChatForStopId(stopId); setUnreadMap(prev => ({ ...prev, [stopId]: 0 })); };
   const closeChat = () => setOpenChatForStopId(null);
 
-  // Auto-scroll
   useEffect(() => {
     if (!waitingAtStop || !scrollRef.current) return;
     const idx = routeStops.findIndex(s => s._id === waitingAtStop);
@@ -1033,7 +1034,6 @@ Would you like to coordinate with them? Your passengers can transfer to their va
     setTimeout(() => scrollRef.current?.scrollTo({ y: 760 + idx * 130, animated: true }), 700);
   }, [waitingAtStop]);
 
-  // ── GOING_TO_DESTINATION state banner ────────────────────────────────────
   const goingToDestBanner = rideState === "GOING_TO_DESTINATION" && (
     <View style={S.goingDestBanner}>
       <Ionicons name="navigate" size={18} color="#fff" />
@@ -1047,7 +1047,6 @@ Would you like to coordinate with them? Your passengers can transfer to their va
   return (
     <View style={{ flex: 1, backgroundColor: "#F6FAF5" }}>
 
-      {/* ── Sticky confirmation banner ── */}
       {routeStarted && waitingAtStop && (
         <View style={S.stickyWrap}>
           {passengerHasConfirmed && (
@@ -1083,7 +1082,6 @@ Would you like to coordinate with them? Your passengers can transfer to their va
         </View>
       )}
 
-      {/* GOING_TO_DESTINATION banner */}
       {goingToDestBanner}
 
       <ScrollView
@@ -1096,7 +1094,6 @@ Would you like to coordinate with them? Your passengers can transfer to their va
 
         {currentRoute ? (
           <>
-            {/* ── Route header ── */}
             <View style={S.header}>
               <Text style={S.routeTitle} numberOfLines={2}>
                 {currentRoute.routeName || currentRoute.name || "Assigned Route"}
@@ -1142,14 +1139,15 @@ Would you like to coordinate with them? Your passengers can transfer to their va
                 </TouchableOpacity>
               ) : (
                 <View style={{ gap: 10 }}>
-                  {!waitingAtStop && rideState === "PICKING_UP" && (
+                  {!waitingAtStop && rideState === "PICKING_UP" && !allPicked && (
                     <View style={[S.btn, { backgroundColor: "#2A4A2C" }]}>
                       <View style={{ width: 9, height: 9, borderRadius: 5, backgroundColor: "#6EE7B7" }} />
                       <Text style={S.btnTxt}>Route in Progress</Text>
                     </View>
                   )}
 
-                  {/* When all passengers are picked (or skipped) — show "Go to Destination" */}
+                  {/* Manual button hidden — auto-triggers via useEffect now */}
+                  {/* Kept as fallback in case auto-trigger fails */}
                   {allPicked && rideState === "PICKING_UP" && !waitingAtStop && (
                     <TouchableOpacity
                       style={[S.btn, { backgroundColor: BLUE }]}
@@ -1160,7 +1158,6 @@ Would you like to coordinate with them? Your passengers can transfer to their va
                     </TouchableOpacity>
                   )}
 
-                  {/* End Route — only available in GOING_TO_DESTINATION state */}
                   <TouchableOpacity
                     style={[S.btn, {
                       backgroundColor: waitingAtStop || rideState === "PICKING_UP"
@@ -1191,13 +1188,22 @@ Would you like to coordinate with them? Your passengers can transfer to their va
                 showsUserLocation={false}
                 showsTraffic={false}
               >
-                {/* Google / OSRM / fallback polyline */}
-                {mapPolylineCoords.length > 1 && (
+                {/* Solid green pickup-route polyline — only in PICKING_UP */}
+                {rideState === "PICKING_UP" && mapPolylineCoords.length > 1 && (
                   <Polyline
                     coordinates={mapPolylineCoords}
                     strokeColor={BRAND}
                     strokeWidth={5}
-                    lineDashPattern={routeStarted ? undefined : [10, 5]}
+                  />
+                )}
+
+                {/* ── FIX: Dotted blue destination polyline — only in GOING_TO_DESTINATION ── */}
+                {rideState === "GOING_TO_DESTINATION" && destPolylineCoords.length > 1 && (
+                  <Polyline
+                    coordinates={destPolylineCoords}
+                    strokeColor={BLUE}
+                    strokeWidth={5}
+                    lineDashPattern={[12, 6]}
                   />
                 )}
 
@@ -1226,7 +1232,7 @@ Would you like to coordinate with them? Your passengers can transfer to their va
                   );
                 })}
 
-                {/* Drop-off pins — show destination name, not passenger name */}
+                {/* Drop-off pins */}
                 {dropStops.map((drop) => (
                   <Marker
                     key={drop.key}
@@ -1272,15 +1278,21 @@ Would you like to coordinate with them? Your passengers can transfer to their va
                   <Text style={S.liveTxt}>LIVE</Text>
                 </View>
               )}
-              {encodedPolyline && (
+              {encodedPolyline && rideState === "PICKING_UP" && (
                 <View style={[S.liveBadge, { right: 10, left: undefined, backgroundColor: "#1E40AF" }]}>
                   <Ionicons name="navigate" size={10} color="#fff" style={{ marginRight: 4 }} />
                   <Text style={S.liveTxt}>MAPS</Text>
                 </View>
               )}
+              {rideState === "GOING_TO_DESTINATION" && destPolylineCoords.length > 1 && (
+                <View style={[S.liveBadge, { right: 10, left: undefined, backgroundColor: BLUE }]}>
+                  <Ionicons name="flag" size={10} color="#fff" style={{ marginRight: 4 }} />
+                  <Text style={S.liveTxt}>DEST</Text>
+                </View>
+              )}
             </View>
 
-            {/* ── Not Going Alert Banner for Driver (from doc3) ── */}
+            {/* Not Going Alert Banner */}
             {notGoingAlert && (
               <View style={{
                 marginHorizontal: 16, marginTop: 12, backgroundColor: "#DC2626",
@@ -1304,7 +1316,7 @@ Would you like to coordinate with them? Your passengers can transfer to their va
               </View>
             )}
 
-            {/* ── Passenger Sequence list ── */}
+            {/* Passenger Sequence list */}
             <View style={{ paddingHorizontal: 16, paddingTop: 16 }}>
               <Text style={[S.secTitle, { marginBottom: 12 }]}>
                 {"Passenger Sequence"}
@@ -1370,7 +1382,6 @@ Would you like to coordinate with them? Your passengers can transfer to their va
                             {"🚐 Van heading here next"}
                           </Text>
                         )}
-                        {/* Not Going local badge (from doc3) */}
                         {stop._notGoingLocal && (
                           <View style={{
                             flexDirection: "row", alignItems: "center", marginTop: 4,
@@ -1430,7 +1441,6 @@ Would you like to coordinate with them? Your passengers can transfer to their va
                 );
               })}
 
-              {/* Destination section in list */}
               {rideState === "GOING_TO_DESTINATION" && currentRoute?.destination && (
                 <View style={[S.stopRow, { borderColor: BLUE, borderWidth: 2, backgroundColor: "#EFF6FF" }]}>
                   <View style={[S.stopNum, { backgroundColor: BLUE }]}>
